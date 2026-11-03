@@ -1,0 +1,266 @@
+// =============================================================================
+// Payment Gateway — schema PostgreSQL
+//
+// Princípios:
+//  * Nenhuma credencial em claro: campos *Ciphertext guardam AES-256-GCM
+//    (formato "gcm1.<keyId>.<iv>.<tag>.<ct>") com AAD vinculando o dado ao registro.
+//  * Dados pessoais (LGPD) de pagadores: cifrados + blind index (HMAC) para busca.
+//  * Valores monetários sempre em centavos (Int) — nunca float.
+//  * Toda mudança de status de transação gera um TransactionEvent (trilha de auditoria).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MerchantStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum PaymentProvider {
+  BANCO_DO_BRASIL
+  CAIXA
+  MOCK_ACQUIRER
+}
+
+enum ProviderEnvironment {
+  SANDBOX
+  PRODUCTION
+}
+
+enum PaymentMethod {
+  PIX
+  BOLETO
+  CREDIT_CARD
+}
+
+enum TransactionStatus {
+  PROCESSING // enviada ao banco, resultado ainda não confirmado (ex.: timeout)
+  PENDING // cobrança registrada, aguardando pagamento (Pix/Boleto)
+  AUTHORIZED // cartão autorizado, aguardando captura
+  PAID
+  FAILED
+  CANCELED
+  EXPIRED
+  REFUNDED
+}
+
+enum DocumentType {
+  CPF
+  CNPJ
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+enum TransactionEventSource {
+  API
+  WEBHOOK
+  RECONCILIATION
+  SYSTEM
+}
+
+/// Lojista (cliente white-label do gateway).
+model Merchant {
+  id           String         @id @db.Uuid
+  name         String         @db.VarChar(120)
+  tradeName    String?        @map("trade_name") @db.VarChar(120)
+  documentType DocumentType   @map("document_type")
+  document     String         @unique @db.VarChar(14) // CNPJ/CPF do lojista (dado público do beneficiário)
+  email        String         @db.VarChar(254)
+  status       MerchantStatus @default(ACTIVE)
+  /// Prefixo público da API key (lookup); o segredo nunca é armazenado — só o HMAC.
+  apiKeyPrefix String         @unique @map("api_key_prefix") @db.VarChar(32)
+  apiKeyHash   String         @map("api_key_hash") @db.Char(64)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  convenios       Convenio[]
+  customers       Customer[]
+  transactions    Transaction[]
+  idempotencyKeys IdempotencyKey[]
+
+  @@map("merchants")
+}
+
+/// Configuração bancária de um lojista em um provedor (BB, Caixa, adquirente).
+model Convenio {
+  id               String              @id @db.Uuid
+  merchantId       String              @map("merchant_id") @db.Uuid
+  provider         PaymentProvider
+  environment      ProviderEnvironment
+  label            String              @db.VarChar(80)
+  supportedMethods PaymentMethod[]     @map("supported_methods")
+  /// Maior prioridade vence quando há mais de um convênio apto para o método.
+  priority         Int                 @default(0)
+  isActive         Boolean             @default(true) @map("is_active")
+
+  /// Parâmetros NÃO sensíveis e específicos do provedor (nº convênio, carteira, agência, URLs).
+  settings Json @default("{}")
+
+  /// AES-256-GCM: { clientId, clientSecret, developerAppKey, pixKey, acquirerToken, ... }
+  credentialsCiphertext  String    @map("credentials_ciphertext")
+  /// AES-256-GCM: { format: PEM|PFX, certPem, keyPem, pfxBase64, passphrase, caPem }
+  certificateCiphertext  String?   @map("certificate_ciphertext")
+  /// Incrementado a cada rotação de credenciais — invalida caches de token/agente mTLS.
+  credentialsVersion     Int       @default(1) @map("credentials_version")
+  encryptionKeyId        String    @map("encryption_key_id") @db.VarChar(32)
+  certificateFingerprint String?   @map("certificate_fingerprint") @db.VarChar(64)
+  certificateSubject     String?   @map("certificate_subject") @db.VarChar(512)
+  certificateExpiresAt   DateTime? @map("certificate_expires_at") @db.Timestamptz(3)
+
+  /// Sequencial do "nosso número" (incremento atômico via UPDATE ... RETURNING).
+  nossoNumeroSequence BigInt @default(0) @map("nosso_numero_sequence")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant     Merchant      @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@index([merchantId, isActive, priority])
+  @@map("convenios")
+}
+
+/// Pagador. CPF/CNPJ, e-mail, telefone e endereço ficam cifrados (LGPD).
+model Customer {
+  id             String       @id @db.Uuid
+  merchantId     String       @map("merchant_id") @db.Uuid
+  name           String       @db.VarChar(140)
+  documentType   DocumentType @map("document_type")
+  /// HMAC-SHA256 do documento normalizado (blind index) — permite unicidade/busca.
+  documentHash   String       @map("document_hash") @db.Char(64)
+  /// Ex.: ***.456.789-** — seguro para exibição.
+  documentMasked String       @map("document_masked") @db.VarChar(20)
+  /// AES-256-GCM: { document, email, phone, address }
+  piiCiphertext  String       @map("pii_ciphertext")
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant     Merchant      @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@unique([merchantId, documentHash])
+  @@map("customers")
+}
+
+model Transaction {
+  id                String            @id @db.Uuid
+  merchantId        String            @map("merchant_id") @db.Uuid
+  convenioId        String            @map("convenio_id") @db.Uuid
+  customerId        String            @map("customer_id") @db.Uuid
+  method            PaymentMethod
+  provider          PaymentProvider
+  status            TransactionStatus
+  amountCents       Int               @map("amount_cents")
+  paidAmountCents   Int?              @map("paid_amount_cents")
+  currency          String            @default("BRL") @db.Char(3)
+  description       String?           @db.VarChar(140)
+  /// Chave de idempotência do request que criou a transação (2ª barreira contra duplicidade).
+  idempotencyKey    String            @map("idempotency_key") @db.VarChar(128)
+  /// Identificador do pedido no sistema do lojista.
+  externalReference String?           @map("external_reference") @db.VarChar(64)
+  /// txid (Pix), nosso número (Boleto) ou TID (cartão).
+  providerReference String?           @map("provider_reference") @db.VarChar(64)
+  /// Dados NÃO sensíveis retornados pelo provedor (copia-e-cola, linha digitável, bandeira/last4...).
+  providerData      Json?             @map("provider_data")
+  metadata          Json?
+  failureCode       String?           @map("failure_code") @db.VarChar(64)
+  failureMessage    String?           @map("failure_message") @db.VarChar(500)
+  expiresAt         DateTime?         @map("expires_at") @db.Timestamptz(3)
+  paidAt            DateTime?         @map("paid_at") @db.Timestamptz(3)
+  /// Controle de reconciliação multi-instância (claim otimista por linha).
+  lastSyncedAt      DateTime?         @map("last_synced_at") @db.Timestamptz(3)
+  syncLockedUntil   DateTime?         @map("sync_locked_until") @db.Timestamptz(3)
+  version           Int               @default(1)
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant           @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  convenio Convenio           @relation(fields: [convenioId], references: [id], onDelete: Restrict)
+  customer Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  events   TransactionEvent[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@unique([convenioId, providerReference])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([merchantId, externalReference])
+  @@index([provider, providerReference])
+  @@index([status, lastSyncedAt])
+  @@map("transactions")
+}
+
+/// Trilha de auditoria imutável de cada transição de status.
+model TransactionEvent {
+  id            String                 @id @default(uuid()) @db.Uuid
+  transactionId String                 @map("transaction_id") @db.Uuid
+  type          String                 @db.VarChar(64)
+  fromStatus    TransactionStatus?     @map("from_status")
+  toStatus      TransactionStatus?     @map("to_status")
+  source        TransactionEventSource
+  data          Json?
+  createdAt     DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId, createdAt])
+  @@map("transaction_events")
+}
+
+/// Controle de idempotência por lojista (Idempotency-Key).
+model IdempotencyKey {
+  id             String            @id @default(uuid()) @db.Uuid
+  merchantId     String            @map("merchant_id") @db.Uuid
+  key            String            @db.VarChar(128)
+  scope          String            @db.VarChar(64)
+  requestHash    String            @map("request_hash") @db.Char(64)
+  status         IdempotencyStatus
+  responseStatus Int?              @map("response_status")
+  responseBody   Json?             @map("response_body")
+  transactionId  String?           @map("transaction_id") @db.Uuid
+  lockedUntil    DateTime          @map("locked_until") @db.Timestamptz(3)
+  expiresAt      DateTime          @map("expires_at") @db.Timestamptz(3)
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+/// Webhooks recebidos dos bancos (deduplicação + auditoria + reprocessamento).
+model WebhookEvent {
+  id                String             @id @default(uuid()) @db.Uuid
+  provider          PaymentProvider
+  /// Chave natural do evento (ex.: endToEndId do Pix) — garante processamento único.
+  eventKey          String             @map("event_key") @db.VarChar(128)
+  eventType         String             @map("event_type") @db.VarChar(64)
+  providerReference String?            @map("provider_reference") @db.VarChar(64)
+  transactionId     String?            @map("transaction_id") @db.Uuid
+  status            WebhookEventStatus
+  payload           Json
+  errorMessage      String?            @map("error_message") @db.VarChar(500)
+  receivedAt        DateTime           @default(now()) @map("received_at") @db.Timestamptz(3)
+  processedAt       DateTime?          @map("processed_at") @db.Timestamptz(3)
+
+  @@unique([provider, eventKey])
+  @@index([status, receivedAt])
+  @@map("webhook_events")
+}

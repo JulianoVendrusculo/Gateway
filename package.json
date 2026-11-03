@@ -1,0 +1,61 @@
+{
+  "name": "payment-gateway",
+  "version": "0.1.0",
+  "description": "Gateway de pagamentos white-label (Pix, Boleto, Cartão) com roteamento para Banco do Brasil e Caixa",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "test": "jest --config jest.config.ts",
+    "test:e2e": "jest --config test/jest-e2e.config.ts --runInBand",
+    "keys:generate": "node -e \"const c=require('crypto');console.log('ENCRYPTION_KEYS=k1:'+c.randomBytes(32).toString('base64'));console.log('BLIND_INDEX_KEY='+c.randomBytes(32).toString('base64'));console.log('API_KEY_PEPPER='+c.randomBytes(32).toString('base64'));console.log('ADMIN_API_TOKEN='+c.randomBytes(32).toString('base64url'));console.log('WEBHOOK_SECRET_BB='+c.randomBytes(32).toString('base64url'));console.log('WEBHOOK_SECRET_CAIXA='+c.randomBytes(32).toString('base64url'))\""
+  },
+  "dependencies": {
+    "@nestjs/common": "11.2.8",
+    "@nestjs/core": "11.2.8",
+    "@nestjs/platform-express": "11.2.8",
+    "@nestjs/schedule": "6.1.3",
+    "@nestjs/throttler": "6.7.1",
+    "@prisma/client": "6.19.3",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.14.2",
+    "fast-xml-parser": "5.3.3",
+    "helmet": "8.1.0",
+    "nestjs-pino": "4.6.1",
+    "pdfkit": "0.17.2",
+    "pino": "9.14.0",
+    "pino-http": "10.5.0",
+    "prisma": "6.19.3",
+    "qrcode": "1.5.4",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "undici": "7.16.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "11.0.10",
+    "@nestjs/schematics": "11.0.9",
+    "@nestjs/testing": "11.2.8",
+    "@types/express": "5.0.3",
+    "@types/jest": "29.5.14",
+    "@types/node": "22.18.6",
+    "@types/pdfkit": "0.17.3",
+    "@types/qrcode": "1.5.5",
+    "@types/supertest": "6.0.3",
+    "jest": "29.7.0",
+    "pino-pretty": "13.1.1",
+    "supertest": "7.1.4",
+    "ts-jest": "29.4.4",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}
