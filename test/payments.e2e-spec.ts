@@ -295,6 +295,22 @@ describe('Payment Gateway (e2e)', () => {
       const tx = await prisma.transaction.findUniqueOrThrow({ where: { id: res.body.error.transactionId } });
       expect(tx.status).toBe('FAILED');
     });
+
+    it('servidor com certificado não confiável: o gateway recusa a conexão e nada é enviado', async () => {
+      const strict = await createMerchant('33.000.167/0001-01');
+      // Sem caPem: a CA do banco falso não está entre as raízes públicas, então a verificação do servidor tem de falhar.
+      await http
+        .post(`/v1/admin/merchants/${strict.id}/convenios`)
+        .set(ADMIN)
+        .send(bbConvenio({ format: 'PFX', pfxBase64: certBase64('client.pfx'), passphrase: 'e2e-pfx-pass' }))
+        .expect(201);
+      const requestsBefore = bank.requests.length;
+      const res = await pay({ method: 'PIX', amount: 1000, customer }, 'untrusted-server-1', strict.apiKey).expect(502);
+      expect(res.body.error.code).toBe('BANK_TLS_ERROR');
+      expect(bank.requests.length).toBe(requestsBefore); // nem o pedido de token saiu
+      const tx = await prisma.transaction.findUniqueOrThrow({ where: { id: res.body.error.transactionId } });
+      expect(tx.status).toBe('FAILED');
+    });
   });
 
   describe('Cartão de crédito (adquirente mock + tokenização)', () => {
