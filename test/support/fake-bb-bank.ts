@@ -47,6 +47,8 @@ export class FakeBbBank {
   readonly boletos = new Map<string, Boleto>();
   readonly clientSubjects: string[] = [];
   readonly requests: Array<{ method: string; path: string; body: unknown }> = [];
+  /** Atraso (ms) entre registrar a cobrança Pix e responder: simula a resposta ainda em trânsito. */
+  cobResponseDelayMs = 0;
 
   get baseUrl(): string {
     return `https://localhost:${(this.server!.address() as AddressInfo).port}`;
@@ -114,6 +116,7 @@ export class FakeBbBank {
       }
       const cob: Cob = { txid: cobMatch[1], status: 'ATIVA', criacao: new Date().toISOString(), expiracao: b.calendario.expiracao, valor: b.valor.original, location: `pix.example.com/qr/v2/${randomUUID()}` };
       this.cobs.set(cob.txid, cob);
+      if (this.cobResponseDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.cobResponseDelayMs));
       return send(201, this.cobJson(cob));
     }
     if (cobMatch && req.method === 'GET') {

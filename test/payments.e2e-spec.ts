@@ -214,6 +214,27 @@ describe('Payment Gateway (e2e)', () => {
       expect(tx.body.failure.code).toMatch(/^BANK_REJECTED/);
     });
 
+    it('reconciliação que alcança uma cobrança ainda em criação não derruba a resposta nem perde o copia-e-cola', async () => {
+      const cobsBefore = bank.cobs.size;
+      bank.cobResponseDelayMs = 500;
+      try {
+        // O banco registra a cobrança na hora, mas a resposta demora: a transação segue PROCESSING nesse intervalo.
+        const creating = pay({ ...body, amount: 4321, externalReference: 'order-sync-race' }, 'pix-sync-race-1').then((r) => r);
+        while (bank.cobs.size === cobsBefore) await new Promise((resolve) => setTimeout(resolve, 10));
+        const stats = await app.get(ReconciliationJob).run();
+        expect(stats.changed).toBeGreaterThanOrEqual(1); // a reconciliação chegou primeiro: PROCESSING -> PENDING
+
+        const res = await creating;
+        expect(res.status).toBe(201);
+        expect(res.body.status).toBe('PENDING');
+        expect(isValidBrCode(res.body.pix.copyPaste)).toBe(true);
+        const events = await prisma.transactionEvent.findMany({ where: { transactionId: res.body.id }, orderBy: { createdAt: 'asc' } });
+        expect(events.map((e) => e.type)).toEqual(['payment.created', 'status.synced', 'charge.registered']);
+      } finally {
+        bank.cobResponseDelayMs = 0;
+      }
+    });
+
     it('outro lojista não enxerga a transação (sem IDOR)', async () => {
       const other = await createMerchant('11.444.777/0001-61');
       await http.get(`/v1/payments/${paymentId}`).set(auth(other.apiKey)).expect(404);

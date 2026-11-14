@@ -49,6 +49,22 @@ export class TransactionRepository {
     });
   }
 
+  /**
+   * Grava os dados da cobrança sem tocar no status. Usado quando a criação perde a corrida para uma
+   * consulta ao banco (webhook, reconciliação) que já avançou a transação: o status confirmado fica.
+   */
+  completeChargeData(
+    id: string,
+    data: { providerReference: string; providerData: Prisma.InputJsonObject; expiresAt?: Date },
+    event: TransitionEvent,
+  ): Promise<Transaction> {
+    return this.prisma.$transaction(async (db) => {
+      const tx = await db.transaction.update({ where: { id }, data: { ...data, version: { increment: 1 } } });
+      await db.transactionEvent.create({ data: { transactionId: id, type: event.type, source: event.source, data: event.data } });
+      return tx;
+    });
+  }
+
   recordEvent(transactionId: string, event: TransitionEvent): Promise<unknown> {
     return this.prisma.transactionEvent.create({ data: { transactionId, type: event.type, source: event.source, data: event.data } });
   }
