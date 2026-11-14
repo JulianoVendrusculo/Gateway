@@ -51,11 +51,19 @@ export function parseIsoDate(value: string): Date {
   return d;
 }
 
-/** Converte "dd.MM.yyyy" ou "dd/MM/yyyy" (formatos do BB) -> Date UTC. */
+/**
+ * Converte "dd.MM.yyyy" ou "dd/MM/yyyy" (formatos do BB, com ou sem hora) -> Date UTC.
+ * Nunca lança: o banco usa marcadores como "00.00.0000" em campos sem valor, e isso
+ * não pode derrubar a consulta de um título pago.
+ */
 export function parseBrDate(value: string): Date | undefined {
-  const m = /^(\d{2})[./](\d{2})[./](\d{4})$/.exec(value.trim());
+  const m = /^(\d{2})[./](\d{2})[./](\d{4})(?:\s|$)/.exec(value.trim());
   if (!m) return undefined;
-  return parseIsoDate(`${m[3]}-${m[2]}-${m[1]}`);
+  try {
+    return parseIsoDate(`${m[3]}-${m[2]}-${m[1]}`);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Formata data civil ("yyyy-MM-dd" em UTC) com o padrão dado, sem conversão de fuso. */

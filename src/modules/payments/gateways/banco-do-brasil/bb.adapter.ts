@@ -124,8 +124,8 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
       const body = parseBankJson(PROVIDER, 'boleto.get', res, boletoGetResponseSchema);
       const state = body.codigoEstadoTituloCobranca;
       const line = onlyDigits(body.linhaDigitavel ?? body.codigoLinhaDigitavel ?? '');
-      const due = body.dataVencimentoTituloCobranca ? parseBrDate(body.dataVencimentoTituloCobranca) : undefined;
-      const issue = body.dataEmissaoTituloCobranca ? parseBrDate(body.dataEmissaoTituloCobranca) : undefined;
+      const due = parseBrDate(body.dataVencimentoTituloCobranca ?? '');
+      const issue = parseBrDate(body.dataEmissaoTituloCobranca ?? '');
       const providerData =
         line.length === 47 && due
           ? {
@@ -139,13 +139,12 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
             }
           : undefined;
       if (BB_PAID_STATES.has(state)) {
-        const paidDate = body.dataRecebimentoTitulo ?? body.dataCreditoLiquidacao;
         return {
           status: TransactionStatus.PAID,
           providerStatus: `ESTADO_${state}`,
           providerData,
           paidAmountCents: body.valorPagoSacado !== undefined ? decimalToCents(body.valorPagoSacado) : undefined,
-          paidAt: paidDate ? parseBrDate(paidDate) : undefined,
+          paidAt: parseBrDate(body.dataRecebimentoTitulo ?? '') ?? parseBrDate(body.dataCreditoLiquidacao ?? ''),
         };
       }
       if (BB_WRITTEN_OFF_STATES.has(state)) return { status: TransactionStatus.CANCELED, providerStatus: `ESTADO_${state}`, providerData };

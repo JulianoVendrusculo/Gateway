@@ -127,7 +127,7 @@ export class ProcessPaymentUseCase {
     if (cmd.method === PaymentMethod.BOLETO) {
       if (!cmd.boleto) throw new ValidationError('boleto é obrigatório quando method=BOLETO');
       if (!cmd.customer.address) throw new ValidationError('customer.address é obrigatório para boleto');
-      const days = diffInDays(parseIsoDate(todayBr()), parseIsoDate(cmd.boleto.dueDate));
+      const days = diffInDays(parseIsoDate(todayBr()), parseDueDate(cmd.boleto.dueDate));
       if (days < 0) throw new ValidationError('boleto.dueDate não pode estar no passado');
       if (days > MAX_BOLETO_DAYS_AHEAD) throw new ValidationError('boleto.dueDate muito distante');
     }
@@ -238,6 +238,15 @@ export class ProcessPaymentUseCase {
       // Não mascara o erro original; a transação fica PROCESSING e será reconciliada.
       this.logger.error({ msg: 'failed to persist charge failure', ...log, err: persistErr });
     }
+  }
+}
+
+/** O DTO garante o formato YYYY-MM-DD; aqui barramos datas que não existem no calendário (ex.: 30/02). */
+function parseDueDate(value: string): Date {
+  try {
+    return parseIsoDate(value);
+  } catch {
+    throw new ValidationError('boleto.dueDate não é uma data válida');
   }
 }
 

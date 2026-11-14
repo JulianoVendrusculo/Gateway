@@ -254,6 +254,7 @@ describe('Payment Gateway (e2e)', () => {
       const noAddress = await pay({ ...body, customer: { ...customer, address: undefined } }, 'boleto-no-address').expect(400);
       expect(noAddress.body.error.message).toContain('address');
       await pay({ ...body, boleto: { ...body.boleto, dueDate: '2020-01-01' } }, 'boleto-past-due').expect(400);
+      await pay({ ...body, boleto: { ...body.boleto, dueDate: '2030-02-30' } }, 'boleto-impossible-date').expect(400);
       await pay({ ...body, boleto: { ...body.boleto, finePercent: 10 } }, 'boleto-fine-cdc').expect(400);
       await pay({ ...body, pix: {} }, 'boleto-with-pix-opts').expect(400);
       expect(await prisma.transaction.count({ where: { method: 'BOLETO' } })).toBe(0);
