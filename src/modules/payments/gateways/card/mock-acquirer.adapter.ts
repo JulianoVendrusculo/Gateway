@@ -91,8 +91,12 @@ export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
     return { token, brand: entry.brand, last4: entry.last4, expMonth: entry.expMonth, expYear: entry.expYear, fingerprint: entry.fingerprint };
   }
 
-  providerReferenceFor(): string | undefined {
-    return undefined; // TID é atribuído pela adquirente
+  /**
+   * Equivale ao "MerchantOrderId" das adquirentes reais: referência gerada pelo gateway e conhecida
+   * antes do envio. É ela que permite consultar a cobrança depois de um timeout (o TID só existe na resposta).
+   */
+  providerReferenceFor(_ctx: GatewayContext, request: ChargeRequest): string | undefined {
+    return request.method === PaymentMethod.CREDIT_CARD ? orderReference(request.transactionId) : undefined;
   }
 
   async createCharge(ctx: GatewayContext, request: ChargeRequest): Promise<ChargeResult> {
@@ -103,7 +107,10 @@ export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
   async getChargeStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
     await this.latency(ctx);
     const charge = this.charges.get(ref.providerReference);
-    if (!charge) return { status: TransactionStatus.PROCESSING, providerStatus: 'NOT_FOUND' };
+    if (!charge) {
+      // Mesmo contrato de um 404 real: passada a carência, a sincronização conclui que a cobrança nunca existiu.
+      throw new BankRejectedError({ provider: PROVIDER, operation: 'card.get', bankHttpStatus: 404, bankErrorCode: 'CHARGE_NOT_FOUND', bankMessage: 'Transação não encontrada na adquirente' });
+    }
     return { status: charge.status, providerStatus: charge.status, paidAmountCents: charge.paidAt ? charge.amountCents : undefined, paidAt: charge.paidAt };
   }
 
@@ -120,13 +127,14 @@ export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
     }
     if (card.last4 === '0028') throw new BankTimeoutError({ provider: PROVIDER, operation });
 
+    const reference = orderReference(req.transactionId);
     const tid = `mock_${randomBytes(10).toString('hex')}`;
     const cardData = { brand: card.brand, last4: card.last4, installments: req.installments, tid };
     if (card.last4 === '0002') {
-      this.charges.set(tid, { status: TransactionStatus.FAILED, amountCents: req.amountCents });
+      this.charges.set(reference, { status: TransactionStatus.FAILED, amountCents: req.amountCents });
       return {
         status: TransactionStatus.FAILED,
-        providerReference: tid,
+        providerReference: reference,
         providerData: { card: cardData },
         failure: { code: 'CARD_DECLINED', message: 'Transação não autorizada pelo emissor' },
       };
@@ -134,11 +142,11 @@ export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
 
     const status = req.capture ? TransactionStatus.PAID : TransactionStatus.AUTHORIZED;
     const paidAt = req.capture ? new Date() : undefined;
-    this.charges.set(tid, { status, amountCents: req.amountCents, paidAt });
+    this.charges.set(reference, { status, amountCents: req.amountCents, paidAt });
     this.logger.log({ msg: 'mock acquirer authorized', transactionId: req.transactionId, status });
     return {
       status,
-      providerReference: tid,
+      providerReference: reference,
       providerData: {
         card: { ...cardData, authorizationCode: randomInt(100000, 999999).toString(), nsu: randomInt(1e8, 1e9 - 1).toString() },
       },
@@ -150,6 +158,10 @@ export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
     const ms = settingsSchema.parse(ctx.settings).simulatedLatencyMs;
     if (ms > 0) await sleep(ms);
   }
+}
+
+function orderReference(transactionId: string): string {
+  return `ord_${transactionId.replace(/-/g, '')}`;
 }
 
 export function detectBrand(pan: string): string {
