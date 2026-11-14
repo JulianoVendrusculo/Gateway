@@ -149,6 +149,13 @@ function collect(node: unknown, key: string, out: unknown[] = []): unknown[] {
 
 const asText = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
+/** Primeiro valor textual de uma tag, em qualquer nível da resposta. */
+export function findSibarText(node: unknown, key: string): string | undefined {
+  return collect(node, key)
+    .map(asText)
+    .find((v): v is string => !!v);
+}
+
 export interface SibarResult {
   dados: XmlNode;
   messages: string[];
