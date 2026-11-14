@@ -78,8 +78,8 @@ npm run start:dev               # http://localhost:3000/health
 Testes:
 
 ```bash
-npm test                        # unitários (51)
-npm run test:e2e                # e2e (21): Postgres real + banco falso com mTLS
+npm test                        # unitários
+npm run test:e2e                # e2e: Postgres real + banco falso HTTPS que exige mTLS
 ```
 
 O e2e usa o banco `payment_gateway_test`, que pode ser alterado via `TEST_DATABASE_URL`. Ele gera uma
@@ -202,10 +202,19 @@ para isso. Os eventos são deduplicados pela chave natural (`endToEndId` / nosso
 | `BankInvalidResponseError`  | 502  | UNCERTAIN             | fica `PROCESSING` → reconciliação       |
 
 A transação é gravada **antes** da chamada ao banco (write-ahead), com uma referência determinística
-(txid / nosso número). Assim, um timeout nunca vira cobrança perdida nem duplicada: a reconciliação
-consulta o banco, completa os dados (linha digitável, copia-e-cola) e ajusta o status. Retries
-automáticos só acontecem em operações idempotentes (GET, `PUT /cob/{txid}`, token) ou quando nada
-chegou a ser enviado (falha de conexão).
+(txid, nosso número ou id do pedido na adquirente). Assim, um timeout nunca vira cobrança perdida nem
+duplicada: a reconciliação consulta o banco, completa os dados (linha digitável, copia-e-cola) e ajusta
+o status. Retries automáticos só acontecem em operações idempotentes (GET, `PUT /cob/{txid}`, token) ou
+quando nada chegou a ser enviado (falha de conexão).
+
+Regras da reconciliação que valem a pena conhecer:
+- Uma cobrança `PROCESSING` que o provedor diz não conhecer (HTTP 404) vira `FAILED` depois de 15 minutos.
+  Antes disso a ausência não prova nada, porque o registro pode estar em andamento.
+- Se uma consulta ao banco (webhook, job ou `?refresh=true`) confirmar a cobrança enquanto a resposta da
+  criação ainda está em trânsito, o status confirmado fica e a criação só completa os dados. O lojista
+  recebe `201` normalmente.
+- Toda tentativa do job é registrada em `last_synced_at`, inclusive as que falham. Um convênio quebrado
+  (certificado vencido, credencial revogada) vai para o fim da fila e não atrasa os outros lojistas.
 
 ---
 
@@ -224,12 +233,15 @@ homologação de cada banco**:
 **Caixa**
 - [ ] Confirmar endpoints SIBAR, versão do leiaute e `USUARIO_SERVICO` (`caixa.config.ts`).
 - [ ] Validar o hash de `AUTENTICACAO` e os campos de `INCLUI_BOLETO` com o manual vigente.
-- [ ] Validar os textos de "SITUACAO DO TITULO" no `CONSULTA_BOLETO` (hoje o mapeamento é conservador: o que não for reconhecido continua `PENDING`).
+- [ ] Validar os textos de "SITUACAO DO TITULO" no `CONSULTA_BOLETO` (`mapConsultaBoleto`). O mapeamento aceita `=` ou `:` como separador e é conservador: só liquidação explícita vira `PAID`, e texto não reconhecido continua `PENDING` com o aviso `caixa boleto status not recognized` no log.
+- [ ] Confirmar se o `CONSULTA_BOLETO` devolve `LINHA_DIGITAVEL` e `DATA_VENCIMENTO`. É com eles que um boleto de registro incerto (timeout no `INCLUI_BOLETO`) recupera os dados; sem eles a transação fica `PENDING` sem linha digitável.
+- [ ] Identificar o código de retorno de "título inexistente". O SIGCB responde HTTP 200 com `COD_RETORNO` de erro, então hoje um boleto que nunca chegou a ser registrado permanece `PROCESSING` (não há como distinguir de outras recusas).
 - [ ] Obter URLs, credenciais e certificado da API Pix da Caixa no credenciamento.
 - [ ] Conciliação de boleto: o SIGCB não envia webhook. Use a reconciliação ativa e/ou importe o arquivo de retorno CNAB 240 (próximo passo).
 
 **Cartão**
-- [ ] Substituir `MockAcquirerAdapter` por um adapter real (Cielo, Rede, Getnet, Stone…) com a mesma interface. A adquirente mock é bloqueada em `PRODUCTION`.
+- [ ] Substituir `MockAcquirerAdapter` por um adapter real (Cielo, Rede, Getnet, Stone…) com a mesma interface. A adquirente mock é bloqueada em `PRODUCTION` e guarda tokens e cobranças em memória (uma instância só).
+- [ ] No adapter real, `providerReferenceFor` deve devolver o id do pedido enviado à adquirente (MerchantOrderId ou equivalente) e `getChargeStatus` deve consultar por ele. É isso que resolve autorizações com timeout.
 - [ ] Preferir tokenização client-side (SDK JS da adquirente) para que o lojista fique em SAQ A.
 
 ---
@@ -242,3 +254,4 @@ homologação de cada banco**:
 - Envelope encryption com KMS/HSM (a interface `KeyRing` já isola a origem das chaves) e um job de re-cifragem.
 - Circuit breaker por provedor, métricas (Prometheus/OpenTelemetry) e alertas de certificado próximo do vencimento (hoje é log `warn`).
 - Back-office com SSO/RBAC no lugar do `ADMIN_API_TOKEN`.
+- Migrar para o Prisma 7. É a única pendência do `npm audit --omit=dev`: o aviso é da `deepmerge-ts`, usada pelo CLI do Prisma ao carregar a configuração (build e `migrate deploy`), fora do caminho das requisições.

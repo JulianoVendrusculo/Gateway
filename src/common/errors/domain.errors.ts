@@ -118,12 +118,18 @@ export class IdempotencyInProgressError extends AppError {
   }
 }
 
-/** Falha de integridade/decifragem — nunca expõe detalhes ao cliente. */
+/**
+ * Falha de integridade/decifragem. O motivo fica em `reason`, que vai para o log junto do erro;
+ * `details` (que o cliente recebe) fica vazio para não revelar o estado do chaveiro.
+ */
 export class CryptoIntegrityError extends AppError {
   readonly code = 'INTERNAL_ERROR';
   readonly httpStatus = 500;
-  constructor(reason: string, options: AppErrorOptions = {}) {
-    super('Erro interno', { ...options, details: { reason } });
+  constructor(
+    readonly reason: string,
+    options: AppErrorOptions = {},
+  ) {
+    super('Erro interno', { cause: options.cause });
   }
 }
 
