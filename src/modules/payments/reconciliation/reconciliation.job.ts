@@ -58,6 +58,10 @@ export class ReconciliationJob implements OnApplicationBootstrap {
         } catch (err) {
           stats.failed++;
           this.logger.warn({ msg: 'reconciliation item failed', transactionId: id, err });
+          // Registra a tentativa para o item ir ao fim da fila. Sem isso, cobranças que falham sempre
+          // (um convênio com certificado vencido, por exemplo) ocupariam todos os lotes e travariam a
+          // conciliação dos demais lojistas. A nova tentativa respeita RECONCILIATION_MIN_RESYNC_SECONDS.
+          await this.prisma.transaction.updateMany({ where: { id }, data: { lastSyncedAt: new Date() } });
         }
       }
       const purged = await this.idempotency.purgeExpired();

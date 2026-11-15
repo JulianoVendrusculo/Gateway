@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Convenio, PaymentMethod, Prisma, Transaction, TransactionEventSource, TransactionStatus } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
-import { AppError, BankIntegrationError, UnexpectedProcessingError, ValidationError } from '../../../common/errors';
+import { AppError, BankIntegrationError, ConcurrentModificationError, UnexpectedProcessingError, ValidationError } from '../../../common/errors';
 import { diffInDays, parseIsoDate, todayBr } from '../../../common/utils/date-helpers';
 import { isUniqueViolation } from '../../../infra/database/prisma.service';
 import { AuthenticatedMerchant } from '../../auth/authenticated-merchant';
@@ -127,7 +127,7 @@ export class ProcessPaymentUseCase {
     if (cmd.method === PaymentMethod.BOLETO) {
       if (!cmd.boleto) throw new ValidationError('boleto é obrigatório quando method=BOLETO');
       if (!cmd.customer.address) throw new ValidationError('customer.address é obrigatório para boleto');
-      const days = diffInDays(parseIsoDate(todayBr()), parseIsoDate(cmd.boleto.dueDate));
+      const days = diffInDays(parseIsoDate(todayBr()), parseDueDate(cmd.boleto.dueDate));
       if (days < 0) throw new ValidationError('boleto.dueDate não pode estar no passado');
       if (days > MAX_BOLETO_DAYS_AHEAD) throw new ValidationError('boleto.dueDate muito distante');
     }
@@ -176,22 +176,32 @@ export class ProcessPaymentUseCase {
     const providerData = result.providerData.boleto
       ? { ...result.providerData, boleto: { ...result.providerData.boleto, instructions: cmd.boleto?.instructions ?? [] } }
       : result.providerData;
-    return this.transactions.transition(
-      tx.id,
-      TransactionStatus.PROCESSING,
-      result.status,
-      {
-        providerReference: result.providerReference,
-        providerData: providerData as Prisma.InputJsonObject,
-        expiresAt: result.expiresAt,
-        paidAt: result.paidAt,
-        paidAmountCents: result.paidAmountCents,
-        failureCode: result.failure?.code ?? null,
-        failureMessage: result.failure?.message ?? null,
-        lastSyncedAt: new Date(),
-      },
-      { type: 'charge.registered', source: TransactionEventSource.API, data: { provider: gateway.provider, status: result.status } },
-    );
+    const charge = { providerReference: result.providerReference, providerData: providerData as Prisma.InputJsonObject, expiresAt: result.expiresAt };
+    const event = { type: 'charge.registered', source: TransactionEventSource.API, data: { provider: gateway.provider, status: result.status } };
+    try {
+      return await this.transactions.transition(
+        tx.id,
+        TransactionStatus.PROCESSING,
+        result.status,
+        {
+          ...charge,
+          paidAt: result.paidAt,
+          paidAmountCents: result.paidAmountCents,
+          failureCode: result.failure?.code ?? null,
+          failureMessage: result.failure?.message ?? null,
+          lastSyncedAt: new Date(),
+        },
+        event,
+      );
+    } catch (err) {
+      if (!(err instanceof ConcurrentModificationError)) throw err;
+      // Uma consulta ao banco (webhook, reconciliação ou ?refresh=true) confirmou a cobrança enquanto a
+      // resposta da criação estava em trânsito. O status gravado veio do banco e é igual ou mais recente
+      // que o desta resposta: ele fica, e aqui só completamos os dados da cobrança.
+      const updated = await this.transactions.completeChargeData(tx.id, charge, { ...event, data: { ...event.data, statusKept: true } });
+      this.logger.warn({ msg: 'charge confirmed by a concurrent sync before the create response', transactionId: tx.id, status: updated.status, resultStatus: result.status });
+      return updated;
+    }
   }
 
   /**
@@ -228,6 +238,15 @@ export class ProcessPaymentUseCase {
       // Não mascara o erro original; a transação fica PROCESSING e será reconciliada.
       this.logger.error({ msg: 'failed to persist charge failure', ...log, err: persistErr });
     }
+  }
+}
+
+/** O DTO garante o formato YYYY-MM-DD; aqui barramos datas que não existem no calendário (ex.: 30/02). */
+function parseDueDate(value: string): Date {
+  try {
+    return parseIsoDate(value);
+  } catch {
+    throw new ValidationError('boleto.dueDate não é uma data válida');
   }
 }
 

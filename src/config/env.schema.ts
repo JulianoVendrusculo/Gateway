@@ -29,7 +29,7 @@ export const envSchema = z
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
-    TRUST_PROXY: booleanFromString.default('false'),
+    TRUST_PROXY: booleanFromString.default(false),
     CORS_ORIGINS: csv,
 
     DATABASE_URL: z.string().url(),
@@ -42,14 +42,14 @@ export const envSchema = z
 
     WEBHOOK_SECRET_BB: optionalSecret,
     WEBHOOK_SECRET_CAIXA: optionalSecret,
-    WEBHOOK_REQUIRE_MTLS: booleanFromString.default('false'),
+    WEBHOOK_REQUIRE_MTLS: booleanFromString.default(false),
     WEBHOOK_MTLS_VERIFY_HEADER: z.string().default('x-ssl-client-verify'),
     WEBHOOK_MTLS_SUBJECT_HEADER: z.string().default('x-ssl-client-s-dn'),
     WEBHOOK_BB_ALLOWED_SUBJECTS: csv,
     WEBHOOK_CAIXA_ALLOWED_SUBJECTS: csv,
     WEBHOOK_BB_ALLOWED_IPS: csv,
     WEBHOOK_CAIXA_ALLOWED_IPS: csv,
-    WEBHOOK_CONFIRM_WITH_PROVIDER: booleanFromString.default('true'),
+    WEBHOOK_CONFIRM_WITH_PROVIDER: booleanFromString.default(true),
 
     BANK_HTTP_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(20000),
     BANK_HTTP_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(500).max(60000).default(5000),
@@ -57,7 +57,7 @@ export const envSchema = z
 
     IDEMPOTENCY_TTL_HOURS: z.coerce.number().int().min(1).max(24 * 30).default(24),
     IDEMPOTENCY_LOCK_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
-    RECONCILIATION_ENABLED: booleanFromString.default('true'),
+    RECONCILIATION_ENABLED: booleanFromString.default(true),
     RECONCILIATION_INTERVAL_MS: z.coerce.number().int().min(10000).default(300000),
     RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(50),
     RECONCILIATION_MIN_RESYNC_SECONDS: z.coerce.number().int().min(10).default(600),

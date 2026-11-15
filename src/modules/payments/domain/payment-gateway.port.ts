@@ -193,8 +193,9 @@ export interface IPaymentGateway {
   validateConvenio(input: ConvenioValidationInput): ValidatedConvenioConfig;
 
   /**
-   * Referência determinística conhecida ANTES do envio (txid, nosso número), persistida
-   * junto da transação. Permite reconciliar operações com resultado incerto (timeout).
+   * Referência determinística conhecida ANTES do envio (txid, nosso número, id do pedido na adquirente),
+   * persistida junto da transação. Permite reconciliar operações com resultado incerto (timeout):
+   * sem ela a transação ficaria PROCESSING para sempre.
    */
   providerReferenceFor(ctx: GatewayContext, request: ChargeRequest): string | undefined;
 

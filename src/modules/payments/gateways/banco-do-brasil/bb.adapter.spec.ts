@@ -179,6 +179,32 @@ describe('BancoDoBrasilAdapter', () => {
       expect(err.details).toMatchObject({ bankErrorCode: '4874915', bankMessage: 'CEP do pagador inválido' });
     });
 
+    it('título liquidado é confirmado mesmo se o banco mandar uma data inválida', async () => {
+      const { agent, ctx, adapter } = setup();
+      mockToken(agent);
+      agent
+        .get(API)
+        .intercept({ path: (p) => p.startsWith('/cobrancas/v2/boletos/00031285570000000001?'), method: 'GET' })
+        .reply(200, {
+          codigoEstadoTituloCobranca: 6,
+          codigoLinhaDigitavel: barcodeToDigitableLine(barcode),
+          dataVencimentoTituloCobranca: '15.11.2026',
+          dataEmissaoTituloCobranca: '00.00.0000',
+          valorPagoSacado: 150.5,
+          dataRecebimentoTitulo: '00.00.0000',
+          dataCreditoLiquidacao: '16.11.2026',
+        });
+      const status = await adapter.getChargeStatus(ctx, {
+        transactionId: 't',
+        method: PaymentMethod.BOLETO,
+        providerReference: '00031285570000000001',
+        amountCents: 15050,
+        createdAt: new Date(),
+      });
+      expect(status).toMatchObject({ status: TransactionStatus.PAID, paidAmountCents: 15050, paidAt: parseIsoDate('2026-11-16') });
+      expect(status.providerData?.boleto).toMatchObject({ barcode, dueDate: '2026-11-15', issueDate: '2026-11-15' });
+    });
+
     it('5xx no registro é resultado INCERTO e não é retentado (POST não idempotente)', async () => {
       const { agent, ctx, adapter } = setup();
       mockToken(agent);

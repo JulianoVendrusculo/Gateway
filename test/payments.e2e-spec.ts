@@ -1,4 +1,5 @@
 import { NestExpressApplication } from '@nestjs/platform-express';
+import { randomUUID } from 'node:crypto';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
@@ -214,6 +215,27 @@ describe('Payment Gateway (e2e)', () => {
       expect(tx.body.failure.code).toMatch(/^BANK_REJECTED/);
     });
 
+    it('reconciliação que alcança uma cobrança ainda em criação não derruba a resposta nem perde o copia-e-cola', async () => {
+      const cobsBefore = bank.cobs.size;
+      bank.cobResponseDelayMs = 500;
+      try {
+        // O banco registra a cobrança na hora, mas a resposta demora: a transação segue PROCESSING nesse intervalo.
+        const creating = pay({ ...body, amount: 4321, externalReference: 'order-sync-race' }, 'pix-sync-race-1').then((r) => r);
+        while (bank.cobs.size === cobsBefore) await new Promise((resolve) => setTimeout(resolve, 10));
+        const stats = await app.get(ReconciliationJob).run();
+        expect(stats.changed).toBeGreaterThanOrEqual(1); // a reconciliação chegou primeiro: PROCESSING -> PENDING
+
+        const res = await creating;
+        expect(res.status).toBe(201);
+        expect(res.body.status).toBe('PENDING');
+        expect(isValidBrCode(res.body.pix.copyPaste)).toBe(true);
+        const events = await prisma.transactionEvent.findMany({ where: { transactionId: res.body.id }, orderBy: { createdAt: 'asc' } });
+        expect(events.map((e) => e.type)).toEqual(['payment.created', 'status.synced', 'charge.registered']);
+      } finally {
+        bank.cobResponseDelayMs = 0;
+      }
+    });
+
     it('outro lojista não enxerga a transação (sem IDOR)', async () => {
       const other = await createMerchant('11.444.777/0001-61');
       await http.get(`/v1/payments/${paymentId}`).set(auth(other.apiKey)).expect(404);
@@ -233,6 +255,7 @@ describe('Payment Gateway (e2e)', () => {
       const noAddress = await pay({ ...body, customer: { ...customer, address: undefined } }, 'boleto-no-address').expect(400);
       expect(noAddress.body.error.message).toContain('address');
       await pay({ ...body, boleto: { ...body.boleto, dueDate: '2020-01-01' } }, 'boleto-past-due').expect(400);
+      await pay({ ...body, boleto: { ...body.boleto, dueDate: '2030-02-30' } }, 'boleto-impossible-date').expect(400);
       await pay({ ...body, boleto: { ...body.boleto, finePercent: 10 } }, 'boleto-fine-cdc').expect(400);
       await pay({ ...body, pix: {} }, 'boleto-with-pix-opts').expect(400);
       expect(await prisma.transaction.count({ where: { method: 'BOLETO' } })).toBe(0);
@@ -295,6 +318,22 @@ describe('Payment Gateway (e2e)', () => {
       const tx = await prisma.transaction.findUniqueOrThrow({ where: { id: res.body.error.transactionId } });
       expect(tx.status).toBe('FAILED');
     });
+
+    it('servidor com certificado não confiável: o gateway recusa a conexão e nada é enviado', async () => {
+      const strict = await createMerchant('33.000.167/0001-01');
+      // Sem caPem: a CA do banco falso não está entre as raízes públicas, então a verificação do servidor tem de falhar.
+      await http
+        .post(`/v1/admin/merchants/${strict.id}/convenios`)
+        .set(ADMIN)
+        .send(bbConvenio({ format: 'PFX', pfxBase64: certBase64('client.pfx'), passphrase: 'e2e-pfx-pass' }))
+        .expect(201);
+      const requestsBefore = bank.requests.length;
+      const res = await pay({ method: 'PIX', amount: 1000, customer }, 'untrusted-server-1', strict.apiKey).expect(502);
+      expect(res.body.error.code).toBe('BANK_TLS_ERROR');
+      expect(bank.requests.length).toBe(requestsBefore); // nem o pedido de token saiu
+      const tx = await prisma.transaction.findUniqueOrThrow({ where: { id: res.body.error.transactionId } });
+      expect(tx.status).toBe('FAILED');
+    });
   });
 
   describe('Cartão de crédito (adquirente mock + tokenização)', () => {
@@ -326,6 +365,57 @@ describe('Payment Gateway (e2e)', () => {
       const tok = await tokenize('4000000000000002').expect(201);
       const res = await pay({ method: 'CREDIT_CARD', amount: 100, customer, card: { token: tok.body.token } }, 'card-declined-1', cardMerchant.apiKey).expect(201);
       expect(res.body).toMatchObject({ status: 'FAILED', failure: { code: 'CARD_DECLINED' } });
+    });
+
+    it('timeout da adquirente: fica PROCESSING e a reconciliação encerra a cobrança que nunca foi registrada', async () => {
+      const tok = await tokenize('4000000000000028').expect(201);
+      const res = await pay({ method: 'CREDIT_CARD', amount: 500, customer, card: { token: tok.body.token } }, 'card-timeout-1', cardMerchant.apiKey).expect(504);
+      expect(res.body.error.code).toBe('BANK_TIMEOUT');
+      const id = res.body.error.transactionId as string;
+      const current = async () => (await http.get(`/v1/payments/${id}`).set(auth(cardMerchant.apiKey)).expect(200)).body;
+
+      // Dentro da carência, a adquirente não conhecer a cobrança ainda não prova nada.
+      await app.get(ReconciliationJob).run();
+      expect((await current()).status).toBe('PROCESSING');
+
+      // Passada a carência, a ausência é conclusiva: a cobrança não existe e o lojista pode tentar de novo.
+      await prisma.transaction.update({ where: { id }, data: { createdAt: new Date(Date.now() - 16 * 60_000), lastSyncedAt: null } });
+      await app.get(ReconciliationJob).run();
+      expect(await current()).toMatchObject({ status: 'FAILED', failure: { code: 'NOT_REGISTERED_AT_PROVIDER' } });
+    });
+
+    it('itens que falham na reconciliação não travam a fila dos demais lojistas', async () => {
+      // Um lojista com 60 cobranças que sempre falham ao sincronizar (mais que um lote de 50)...
+      const convenio = await prisma.convenio.findFirstOrThrow({ where: { merchantId: cardMerchant.id } });
+      const payer = await prisma.customer.findFirstOrThrow({ where: { merchantId: cardMerchant.id } });
+      await prisma.transaction.createMany({
+        data: Array.from({ length: 60 }, (_, i) => ({
+          id: randomUUID(),
+          merchantId: cardMerchant.id,
+          convenioId: convenio.id,
+          customerId: payer.id,
+          method: 'CREDIT_CARD' as const,
+          provider: 'MOCK_ACQUIRER' as const,
+          status: 'AUTHORIZED' as const,
+          amountCents: 100,
+          idempotencyKey: `stuck-${i}`,
+          externalReference: 'stuck',
+          providerReference: `ord_desconhecida_${i}`,
+        })),
+      });
+      try {
+        // ...e uma cobrança Pix de outro lojista, já paga no banco, aguardando a vez na fila.
+        const pix = await pay({ method: 'PIX', amount: 2500, customer }, 'pix-behind-stuck-queue').expect(201);
+        bank.payPix(pix.body.pix.txid);
+        await prisma.transaction.update({ where: { id: pix.body.id }, data: { lastSyncedAt: new Date(Date.now() - 3_600_000) } });
+
+        const job = app.get(ReconciliationJob);
+        await job.run(); // o lote inteiro é consumido pelas que falham
+        await job.run(); // elas foram para o fim da fila: agora a Pix é alcançada
+        expect((await http.get(`/v1/payments/${pix.body.id}`).set(auth()).expect(200)).body.status).toBe('PAID');
+      } finally {
+        await prisma.transaction.deleteMany({ where: { externalReference: 'stuck' } });
+      }
     });
   });
 

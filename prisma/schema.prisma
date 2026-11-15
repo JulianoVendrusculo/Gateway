@@ -184,8 +184,9 @@ model Transaction {
   failureMessage    String?           @map("failure_message") @db.VarChar(500)
   expiresAt         DateTime?         @map("expires_at") @db.Timestamptz(3)
   paidAt            DateTime?         @map("paid_at") @db.Timestamptz(3)
-  /// Controle de reconciliação multi-instância (claim otimista por linha).
+  /// Última tentativa de sincronização com o provedor (com ou sem sucesso): ordena a fila da reconciliação.
   lastSyncedAt      DateTime?         @map("last_synced_at") @db.Timestamptz(3)
+  /// Claim otimista por linha: evita que várias instâncias consultem o banco para a mesma transação.
   syncLockedUntil   DateTime?         @map("sync_locked_until") @db.Timestamptz(3)
   version           Int               @default(1)
   createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)

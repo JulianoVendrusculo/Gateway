@@ -34,9 +34,23 @@ describe('MockAcquirerAdapter', () => {
     expect(result).toMatchObject({ status: TransactionStatus.FAILED, failure: { code: 'CARD_DECLINED' } });
   });
 
-  it('cartão ...0028 simula timeout (resultado incerto)', async () => {
+  it('cartão ...0028 simula timeout (resultado incerto) e a consulta posterior não encontra a cobrança', async () => {
     const tok = await adapter.tokenizeCard(ctx, card('4000000000000028'));
-    await expect(adapter.createCharge(ctx, charge(tok.token))).rejects.toBeInstanceOf(BankTimeoutError);
+    const request = { ...charge(tok.token), transactionId: '8f0a6b8e-1c2d-4e5f-9a0b-1c2d3e4f5a6b' };
+    const reference = adapter.providerReferenceFor(ctx, request);
+    expect(reference).toBe('ord_8f0a6b8e1c2d4e5f9a0b1c2d3e4f5a6b');
+    await expect(adapter.createCharge(ctx, request)).rejects.toBeInstanceOf(BankTimeoutError);
+    const lookup = adapter.getChargeStatus(ctx, { transactionId: request.transactionId, method: PaymentMethod.CREDIT_CARD, providerReference: reference!, amountCents: 1000, createdAt: new Date() });
+    await expect(lookup).rejects.toMatchObject({ bankHttpStatus: 404, bankErrorCode: 'CHARGE_NOT_FOUND' });
+  });
+
+  it('a referência conhecida antes do envio localiza a cobrança aprovada', async () => {
+    const tok = await adapter.tokenizeCard(ctx, card('4111111111111111'));
+    const request = { ...charge(tok.token), transactionId: '11111111-2222-4333-8444-555555555555' };
+    const reference = adapter.providerReferenceFor(ctx, request)!;
+    expect((await adapter.createCharge(ctx, request)).providerReference).toBe(reference);
+    const status = await adapter.getChargeStatus(ctx, { transactionId: request.transactionId, method: PaymentMethod.CREDIT_CARD, providerReference: reference, amountCents: 1000, createdAt: new Date() });
+    expect(status).toMatchObject({ status: TransactionStatus.PAID, paidAmountCents: 1000 });
   });
 
   it('token de outro convênio ou inexistente é rejeitado', async () => {
