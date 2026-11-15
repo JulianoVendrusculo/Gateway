@@ -1,6 +1,9 @@
 // =============================================================================
 // Payment Gateway — schema PostgreSQL
 //
+// v2 (cobrança única): uma inscrição = uma Charge; Pix, boleto e cartão são tentativas
+// (Transaction) dentro dela. As migrations da v2 são aditivas: nada da v1 é removido.
+//
 // Princípios:
 //  * Nenhuma credencial em claro: campos *Ciphertext guardam AES-256-GCM
 //    (formato "gcm1.<keyId>.<iv>.<tag>.<ct>") com AAD vinculando o dado ao registro.
@@ -41,14 +44,37 @@ enum PaymentMethod {
 }
 
 enum TransactionStatus {
-  PROCESSING // enviada ao banco, resultado ainda não confirmado (ex.: timeout)
-  PENDING // cobrança registrada, aguardando pagamento (Pix/Boleto)
-  AUTHORIZED // cartão autorizado, aguardando captura
+  // --- v1 (legado): só existem em linhas criadas antes da v2. A v2 nunca grava estes valores.
+  PROCESSING
+  PENDING
+  AUTHORIZED
   PAID
   FAILED
   CANCELED
   EXPIRED
   REFUNDED
+
+  // --- v2. Tentativa ATIVA = PENDENTE, PROCESSANDO ou EM_VERIFICACAO (no máximo uma por Charge).
+  PENDENTE // registrada no banco, aguardando pagamento
+  PROCESSANDO // enviada ao banco, resultado ainda não confirmado (ex.: timeout)
+  EM_VERIFICACAO // venceu; segue bloqueando a Charge durante a janela de tolerância
+  CONFIRMADA // pagamento confirmado: é a transação que quitou a Charge (no máximo uma)
+  CANCELADA // cancelamento CONFIRMADO pelo banco
+  EXPIRADA
+  FALHOU
+  PAGO_DUPLICADO // pagamento confirmado de uma Charge que já estava paga (gera Refund)
+}
+
+enum ChargeStatus {
+  ABERTA
+  PAGA
+  CANCELADA
+  EXPIRADA
+}
+
+enum RefundStatus {
+  /// Único estado que o gateway grava: nenhum estorno é executado automaticamente.
+  PENDENTE_ANALISE
 }
 
 enum DocumentType {
@@ -92,6 +118,7 @@ model Merchant {
 
   convenios       Convenio[]
   customers       Customer[]
+  charges         Charge[]
   transactions    Transaction[]
   idempotencyKeys IdempotencyKey[]
 
@@ -159,8 +186,40 @@ model Customer {
   @@map("customers")
 }
 
+/// Obrigação de pagamento única (ex.: uma inscrição de concurso).
+model Charge {
+  id                String       @id @db.Uuid
+  merchantId        String       @map("merchant_id") @db.Uuid
+  /// Id da inscrição no sistema do lojista.
+  externalReference String       @map("external_reference") @db.VarChar(64)
+  amountCents       Int          @map("amount_cents")
+  currency          String       @default("BRL") @db.Char(3)
+  status            ChargeStatus @default(ABERTA)
+  /// A transação que quitou a cobrança (a primeira confirmação vence).
+  paidTransactionId String?      @unique @map("paid_transaction_id") @db.Uuid
+  paidAt            DateTime?    @map("paid_at") @db.Timestamptz(3)
+  /// Prazo da obrigação (opcional). Depois dele não se criam novas tentativas.
+  expiresAt         DateTime?    @map("expires_at") @db.Timestamptz(3)
+  createdAt         DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  merchant        Merchant      @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  paidTransaction Transaction?  @relation("ChargePaidTransaction", fields: [paidTransactionId], references: [id], onDelete: Restrict)
+  transactions    Transaction[] @relation("ChargeAttempts")
+  refunds         Refund[]
+
+  @@unique([merchantId, externalReference])
+  @@index([status, expiresAt])
+  @@map("charges")
+}
+
+/// Na v2 cada Transaction é uma TENTATIVA de pagamento de uma Charge.
+/// Os índices únicos parciais (uma ativa e uma CONFIRMADA por Charge) existem só na migration:
+/// o Prisma não os representa no schema.
 model Transaction {
   id                String            @id @db.Uuid
+  /// Nulo apenas em transações criadas pela v1.
+  chargeId          String?           @map("charge_id") @db.Uuid
   merchantId        String            @map("merchant_id") @db.Uuid
   convenioId        String            @map("convenio_id") @db.Uuid
   customerId        String            @map("customer_id") @db.Uuid
@@ -184,6 +243,17 @@ model Transaction {
   failureMessage    String?           @map("failure_message") @db.VarChar(500)
   expiresAt         DateTime?         @map("expires_at") @db.Timestamptz(3)
   paidAt            DateTime?         @map("paid_at") @db.Timestamptz(3)
+  /// Id do pagamento no provedor (endToEndId do Pix, liquidação do boleto, pagamento do link).
+  /// É o que distingue um segundo pagamento da MESMA tentativa.
+  providerPaymentId String?           @map("provider_payment_id") @db.VarChar(128)
+  /// Preenchido quando esta linha registra um segundo pagamento da tentativa indicada.
+  duplicateOfId     String?           @map("duplicate_of_id") @db.Uuid
+  /// Fim da janela de tolerância enquanto EM_VERIFICACAO.
+  verificationUntil DateTime?         @map("verification_until") @db.Timestamptz(3)
+  /// Cancelamento pendente de confirmação pelo banco, e por quê (TROCA_DE_METODO | COBRANCA_PAGA).
+  cancelRequestedAt DateTime?         @map("cancel_requested_at") @db.Timestamptz(3)
+  cancelReason      String?           @map("cancel_reason") @db.VarChar(32)
+  cancelAttempts    Int               @default(0) @map("cancel_attempts")
   /// Última tentativa de sincronização com o provedor (com ou sem sucesso): ordena a fila da reconciliação.
   lastSyncedAt      DateTime?         @map("last_synced_at") @db.Timestamptz(3)
   /// Claim otimista por linha: evita que várias instâncias consultem o banco para a mesma transação.
@@ -192,18 +262,47 @@ model Transaction {
   createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt         DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  merchant Merchant           @relation(fields: [merchantId], references: [id], onDelete: Restrict)
-  convenio Convenio           @relation(fields: [convenioId], references: [id], onDelete: Restrict)
-  customer Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
-  events   TransactionEvent[]
+  charge      Charge?            @relation("ChargeAttempts", fields: [chargeId], references: [id], onDelete: Restrict)
+  paidCharge  Charge?            @relation("ChargePaidTransaction")
+  duplicateOf Transaction?       @relation("DuplicatePayments", fields: [duplicateOfId], references: [id], onDelete: Restrict)
+  duplicates  Transaction[]      @relation("DuplicatePayments")
+  refund      Refund?
+  merchant    Merchant           @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+  convenio    Convenio           @relation(fields: [convenioId], references: [id], onDelete: Restrict)
+  customer    Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  events      TransactionEvent[]
 
   @@unique([merchantId, idempotencyKey])
   @@unique([convenioId, providerReference])
+  @@unique([convenioId, providerPaymentId])
+  @@index([chargeId, createdAt])
+  @@index([status, expiresAt])
   @@index([merchantId, createdAt(sort: Desc)])
   @@index([merchantId, externalReference])
   @@index([provider, providerReference])
   @@index([status, lastSyncedAt])
   @@map("transactions")
+}
+
+/// Pendência de estorno de um pagamento duplicado. O gateway só registra: a análise e o
+/// estorno são feitos por uma pessoa.
+model Refund {
+  id            String       @id @default(uuid()) @db.Uuid
+  chargeId      String       @map("charge_id") @db.Uuid
+  /// A transação PAGO_DUPLICADO que originou a pendência.
+  transactionId String       @unique @map("transaction_id") @db.Uuid
+  amountCents   Int          @map("amount_cents")
+  status        RefundStatus @default(PENDENTE_ANALISE)
+  /// COBRANCA_JA_PAGA | SEGUNDO_PAGAMENTO_DA_TENTATIVA
+  reason        String       @db.VarChar(40)
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  charge      Charge      @relation(fields: [chargeId], references: [id], onDelete: Restrict)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@map("refunds")
 }
 
 /// Trilha de auditoria imutável de cada transição de status.
