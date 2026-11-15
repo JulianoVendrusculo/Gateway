@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { BankRejectedError, BankUnavailableError } from '../../../../common/errors';
 import { parseIsoDate } from '../../../../common/utils/date-helpers';
 import { caixaNossoNumero } from './caixa.adapter';
-import { buildIncluiBoletoXml, parseSibarResponse, sibarAuthHash } from './caixa-sibar.client';
+import { buildBaixaBoletoXml, buildIncluiBoletoXml, parseSibarResponse, sibarAuthHash } from './caixa-sibar.client';
 
 const header = { versao: '1.0', autenticacao: 'HASH', usuarioServico: 'SGCBS02P', operacao: 'INCLUI_BOLETO' as const, sistemaOrigem: 'SIGCB', unidade: '1234', now: new Date('2026-10-30T15:00:00Z') };
 
@@ -32,6 +32,13 @@ describe('Caixa SIBAR', () => {
     expect(xml).toContain('<NOME>A&lt;/NOME&gt;&lt;X&gt;&amp;</NOME>');
     expect(xml).toContain('<DATA_HORA>20261030120000</DATA_HORA>');
     expect(xml).toContain('<VALOR>150.50</VALOR>');
+  });
+
+  it('monta o BAIXA_BOLETO no serviço de manutenção, com a operação no cabeçalho', () => {
+    const xml = buildBaixaBoletoXml({ ...header, operacao: 'BAIXA_BOLETO' }, '1234567', '14000000000000001');
+    expect(xml).toContain('<OPERACAO>BAIXA_BOLETO</OPERACAO>');
+    expect(xml).toContain('<DADOS><BAIXA_BOLETO><CODIGO_BENEFICIARIO>1234567</CODIGO_BENEFICIARIO><NOSSO_NUMERO>14000000000000001</NOSSO_NUMERO></BAIXA_BOLETO></DADOS>');
+    expect(xml).toContain('manutencao_cobranca_bancaria');
   });
 
   it('interpreta sucesso e preserva zeros à esquerda', () => {

@@ -1,10 +1,15 @@
 import { PaymentMethod, PaymentProvider, ProviderEnvironment, TransactionStatus } from '@prisma/client';
+import { BankIntegrationError } from '../../../common/errors';
 import { BankHttpClient } from '../../../infra/http/bank-http-client';
 
 // =============================================================================
 // Port (Hexagonal) — contrato único que todo provedor (banco/adquirente) implementa.
 // O núcleo da aplicação só conhece esta interface; o adapter concreto é escolhido
 // em runtime a partir do convênio da transação (Strategy).
+//
+// v2 (cobrança única): além de criar a cobrança, todo provedor precisa saber
+// CONSULTAR (getStatus) e CANCELAR (cancel) uma tentativa. É isso que permite trocar
+// de método com segurança e nunca liberar uma tentativa que ainda pode ser paga.
 // =============================================================================
 
 /** Credenciais do convênio já decifradas — vivem apenas em memória durante a operação. */
@@ -78,13 +83,32 @@ export interface BoletoChargeRequest extends BaseChargeRequest {
   acceptUntilDaysAfterDue?: number;
 }
 
-export interface CardChargeRequest extends BaseChargeRequest {
+/**
+ * Modos de cartão.
+ *  - HOSTED_LINK: o pagador sai da plataforma e paga na página do banco (único modo implementado).
+ *  - DIRECT: dados do cartão tokenizados e autorização na própria chamada. Fica só o tipo, para o
+ *    contrato não precisar mudar quando um adapter passar a oferecê-lo.
+ */
+export type CardMode = 'HOSTED_LINK' | 'DIRECT';
+
+export interface HostedLinkCardChargeRequest extends BaseChargeRequest {
   method: typeof PaymentMethod.CREDIT_CARD;
-  cardToken: string;
-  installments: number;
-  capture: boolean;
+  mode: 'HOSTED_LINK';
+  /** Validade do link. Curta de propósito: enquanto ele vale, a cobrança fica presa a este método. */
+  linkTtlSeconds: number;
+  maxInstallments: number;
   softDescriptor?: string;
 }
+
+export interface DirectCardChargeRequest extends BaseChargeRequest {
+  method: typeof PaymentMethod.CREDIT_CARD;
+  mode: 'DIRECT';
+  cardToken: string;
+  installments: number;
+  softDescriptor?: string;
+}
+
+export type CardChargeRequest = HostedLinkCardChargeRequest | DirectCardChargeRequest;
 
 export type ChargeRequest = PixChargeRequest | BoletoChargeRequest | CardChargeRequest;
 
@@ -108,12 +132,16 @@ export interface BoletoData {
 }
 
 export interface CardData {
-  brand: string;
-  last4: string;
-  installments: number;
+  mode: CardMode;
+  /** HOSTED_LINK: página do banco para onde o pagador é enviado. */
+  paymentUrl?: string;
+  maxInstallments?: number;
+  /** Preenchidos quando o provedor informa, depois do pagamento. */
+  brand?: string;
+  last4?: string;
+  installments?: number;
   authorizationCode?: string;
   nsu?: string;
-  tid?: string;
 }
 
 export interface ProviderData {
@@ -122,16 +150,25 @@ export interface ProviderData {
   card?: CardData;
 }
 
-export type ChargeResultStatus = Extract<TransactionStatus, 'PENDING' | 'AUTHORIZED' | 'PAID' | 'FAILED'>;
+/** Resultado imediato da criação: registrada (aguardando pagamento), já paga, ou recusada. */
+export type ChargeResultStatus = Extract<TransactionStatus, 'PENDENTE' | 'CONFIRMADA' | 'FALHOU'>;
+
+/** Um pagamento informado pelo provedor. O `id` é o que distingue dois pagamentos da mesma cobrança. */
+export interface ProviderPayment {
+  /** endToEndId (Pix), identificador da liquidação (boleto) ou do pagamento (cartão), quando o provedor informa. */
+  id?: string;
+  amountCents?: number;
+  paidAt?: Date;
+}
 
 export interface ChargeResult {
   status: ChargeResultStatus;
   providerReference: string;
   providerData: ProviderData;
   expiresAt?: Date;
-  paidAt?: Date;
-  paidAmountCents?: number;
-  /** Recusa de negócio (ex.: cartão negado) — não é exceção, é resultado. */
+  /** Presente quando status = CONFIRMADA. */
+  payment?: ProviderPayment;
+  /** Recusa de negócio — não é exceção, é resultado. */
   failure?: { code: string; message: string };
 }
 
@@ -144,24 +181,49 @@ export interface ChargeReference {
   expiresAt?: Date | null;
 }
 
+/** Situação da cobrança NO PROVEDOR, no vocabulário da Transaction. */
+export type ProviderChargeStatus = Extract<TransactionStatus, 'PENDENTE' | 'CONFIRMADA' | 'CANCELADA' | 'EXPIRADA'>;
+
 export interface ChargeStatusResult {
-  status: TransactionStatus;
+  /**
+   * PENDENTE: ainda pode ser paga. CONFIRMADA: foi paga. CANCELADA: removida/baixada no provedor.
+   * EXPIRADA: o provedor não aceita mais o pagamento.
+   */
+  status: ProviderChargeStatus;
   /** Status bruto do provedor (para auditoria). */
   providerStatus: string;
-  paidAmountCents?: number;
-  paidAt?: Date;
+  /** Pagamentos recebidos. Mais de um significa pagamento em duplicidade da mesma cobrança. */
+  payments?: ProviderPayment[];
   /** Dados da cobrança, quando o provedor os devolve na consulta (preenche transações reconciliadas). */
   providerData?: ProviderData;
   expiresAt?: Date;
 }
 
-export type WebhookEventType = 'PIX_RECEIVED' | 'BOLETO_PAID' | 'BOLETO_WRITTEN_OFF' | 'UNKNOWN';
+/**
+ * Resultado de um pedido de cancelamento. Nunca é exceção: quem chama precisa tratar os casos.
+ * Mesmo com CANCELED, a regra de negócio só libera a troca de método depois de getStatus() confirmar.
+ */
+export type CancelResult =
+  /** O provedor aceitou o cancelamento (ou a cobrança já estava cancelada). */
+  | { outcome: 'CANCELED'; providerStatus: string }
+  /** Recusado porque a cobrança já foi paga: deve ser tratado como confirmação de pagamento. */
+  | { outcome: 'ALREADY_PAID'; providerStatus: string; payments?: ProviderPayment[] }
+  /** Recusado por outro motivo de negócio: a cobrança continua podendo ser paga. */
+  | { outcome: 'REFUSED'; providerStatus: string; reason?: string }
+  /** O provedor não oferece cancelamento para este tipo de cobrança: o bloqueio vale até a expiração. */
+  | { outcome: 'NOT_SUPPORTED'; reason: string }
+  /** Falha técnica: não se sabe se o cancelamento aconteceu. */
+  | { outcome: 'TECHNICAL_ERROR'; error: BankIntegrationError };
+
+export type WebhookEventType = 'PIX_RECEIVED' | 'BOLETO_PAID' | 'BOLETO_WRITTEN_OFF' | 'CARD_PAID' | 'UNKNOWN';
 
 export interface NormalizedWebhookEvent {
   /** Chave natural única do evento (deduplicação). */
   eventKey: string;
   type: WebhookEventType;
   providerReference: string;
+  /** Identificador do pagamento a que o evento se refere, quando o provedor informa. */
+  paymentId?: string;
   amountCents?: number;
   occurredAt?: Date;
   /** Desambiguação quando a referência só é única por convênio (ex.: nosso número). */
@@ -188,6 +250,8 @@ export interface ValidatedConvenioConfig {
 export interface IPaymentGateway {
   readonly provider: PaymentProvider;
   readonly supportedMethods: ReadonlySet<PaymentMethod>;
+  /** Modos de cartão oferecidos. Ausente ou vazio = o provedor não processa cartão. */
+  readonly cardModes?: ReadonlySet<CardMode>;
 
   /** Valida settings/credenciais específicos do provedor no cadastro do convênio. */
   validateConvenio(input: ConvenioValidationInput): ValidatedConvenioConfig;
@@ -195,45 +259,18 @@ export interface IPaymentGateway {
   /**
    * Referência determinística conhecida ANTES do envio (txid, nosso número, id do pedido na adquirente),
    * persistida junto da transação. Permite reconciliar operações com resultado incerto (timeout):
-   * sem ela a transação ficaria PROCESSING para sempre.
+   * sem ela a transação ficaria PROCESSANDO para sempre.
    */
   providerReferenceFor(ctx: GatewayContext, request: ChargeRequest): string | undefined;
 
   createCharge(ctx: GatewayContext, request: ChargeRequest): Promise<ChargeResult>;
 
-  /** Consulta autoritativa no provedor (usada por webhook e reconciliação). */
-  getChargeStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult>;
+  /** Consulta autoritativa no provedor. É a única fonte que confirma pagamento ou cancelamento. */
+  getStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult>;
+
+  /** Pede o cancelamento da cobrança no provedor. Ver CancelResult. */
+  cancel(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult>;
 
   /** Converte o payload bruto do webhook em eventos normalizados (sem I/O). */
   parseWebhook(payload: unknown): NormalizedWebhookEvent[];
-}
-
-// ---------------------------------------------------------------------------
-// Capacidade opcional: tokenização de cartão (PCI-DSS)
-// ---------------------------------------------------------------------------
-
-export interface RawCardData {
-  number: string;
-  holderName: string;
-  expMonth: number;
-  expYear: number;
-  cvv: string;
-}
-
-export interface CardTokenResult {
-  token: string;
-  brand: string;
-  last4: string;
-  expMonth: number;
-  expYear: number;
-  /** Hash estável do cartão para antifraude/deduplicação (nunca o PAN). */
-  fingerprint: string;
-}
-
-export interface ICardTokenizer {
-  tokenizeCard(ctx: GatewayContext, card: RawCardData): Promise<CardTokenResult>;
-}
-
-export function isCardTokenizer(gateway: IPaymentGateway): gateway is IPaymentGateway & ICardTokenizer {
-  return typeof (gateway as Partial<ICardTokenizer>).tokenizeCard === 'function';
 }

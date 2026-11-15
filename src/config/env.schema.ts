@@ -50,6 +50,17 @@ export const envSchema = z
     WEBHOOK_BB_ALLOWED_IPS: csv,
     WEBHOOK_CAIXA_ALLOWED_IPS: csv,
     WEBHOOK_CONFIRM_WITH_PROVIDER: booleanFromString.default(true),
+    // Só para o provedor simulado de link de cartão (a rota é recusada em produção).
+    WEBHOOK_SECRET_MOCK_ACQUIRER: optionalSecret,
+
+    // v2 — cobrança única
+    // Validade do link de cartão: curta, porque enquanto vale a cobrança fica presa a este método.
+    CARD_LINK_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(900),
+    // Janela de tolerância depois do vencimento de uma tentativa: ela fica EM_VERIFICACAO e continua
+    // bloqueando a cobrança, porque a confirmação pode chegar atrasada. Zero libera na hora.
+    VERIFICATION_WINDOW_PIX_SECONDS: z.coerce.number().int().min(0).max(3_600).default(60),
+    VERIFICATION_WINDOW_BOLETO_SECONDS: z.coerce.number().int().min(0).max(30 * 86_400).default(3 * 86_400),
+    VERIFICATION_WINDOW_CARD_SECONDS: z.coerce.number().int().min(0).max(7 * 86_400).default(1_800),
 
     BANK_HTTP_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(20000),
     BANK_HTTP_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(500).max(60000).default(5000),

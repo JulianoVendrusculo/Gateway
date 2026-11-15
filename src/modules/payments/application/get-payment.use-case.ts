@@ -5,8 +5,9 @@ import { PrismaService } from '../../../infra/database/prisma.service';
 import { CustomersService } from '../../customers/customers.service';
 import { renderBoletoPdf } from '../boleto/boleto-pdf.renderer';
 import { ProviderData } from '../domain/payment-gateway.port';
-import { PaymentPresenter, PaymentView } from './payment.presenter';
-import { SyncPaymentStatusUseCase } from './sync-payment-status.use-case';
+import { AttemptLifecycleService } from './attempt-lifecycle.service';
+import { ChargeRepository } from './charge.repository';
+import { ChargeView, PaymentPresenter, PaymentView } from './payment.presenter';
 import { TransactionRepository } from './transaction.repository';
 
 const BANKS: Record<string, { code: string; name: string }> = {
@@ -21,7 +22,8 @@ export class GetPaymentUseCase {
   constructor(
     private readonly transactions: TransactionRepository,
     private readonly presenter: PaymentPresenter,
-    private readonly sync: SyncPaymentStatusUseCase,
+    private readonly lifecycle: AttemptLifecycleService,
+    private readonly charges: ChargeRepository,
     private readonly customers: CustomersService,
     private readonly prisma: PrismaService,
   ) {}
@@ -31,7 +33,7 @@ export class GetPaymentUseCase {
     if (!tx) throw new ResourceNotFoundError('Pagamento');
     if (refresh) {
       try {
-        await this.sync.execute(tx.id, TransactionEventSource.API);
+        await this.lifecycle.advance(tx.id, TransactionEventSource.API);
         tx = (await this.transactions.findForMerchant(id, merchantId))!;
       } catch (err) {
         // Consulta ao banco é "best effort": devolve o último estado conhecido.
@@ -39,6 +41,16 @@ export class GetPaymentUseCase {
       }
     }
     return this.presenter.present(tx, tx.customer);
+  }
+
+  /**
+   * Situação da cobrança única de uma inscrição, com a tentativa ativa (QR Code, boleto ou link).
+   * É o que o front consulta para mostrar "aguardando confirmação" em vez de gerar outro pagamento.
+   */
+  async charge(merchantId: string, externalReference: string): Promise<ChargeView> {
+    const charge = await this.charges.findByReference(merchantId, externalReference);
+    if (!charge) throw new ResourceNotFoundError('Cobrança');
+    return this.presenter.presentCharge(charge);
   }
 
   async boletoPdf(merchantId: string, id: string): Promise<{ filename: string; pdf: Buffer }> {

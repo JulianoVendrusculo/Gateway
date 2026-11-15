@@ -20,7 +20,9 @@ export class PaymentsController {
   ) {}
 
   /**
-   * Cria uma cobrança (PIX | BOLETO | CREDIT_CARD).
+   * Cria ou devolve a tentativa de pagamento (PIX | BOLETO | CREDIT_CARD) da cobrança da inscrição.
+   * 201: tentativa nova. 200: a tentativa ativa do mesmo método (mesmo boleto, QR Code ou link).
+   * 409: PAGAMENTO_JA_CONFIRMADO, TENTATIVA_EM_ANDAMENTO ou CANCELAMENTO_RECUSADO.
    * Header obrigatório: Idempotency-Key. Repetições com a mesma chave devolvem a resposta original.
    */
   @Post()
@@ -35,14 +37,15 @@ export class PaymentsController {
     const result = await this.idempotency.execute(
       { merchantId: merchant.id, key: idempotencyKey, scope: 'POST /v1/payments', payload: dto, requestId: String(req.id) },
       async () => {
-        const view = await this.processPayment.execute({
+        const { view, created } = await this.processPayment.execute({
           merchant,
           idempotencyKey: idempotencyKey!,
+          externalReference: dto.externalReference,
           method: dto.method,
           amountCents: dto.amount,
           description: dto.description,
-          externalReference: dto.externalReference,
           convenioId: dto.convenioId,
+          chargeExpiresAt: dto.chargeExpiresAt,
           customer: {
             name: dto.customer.name,
             document: dto.customer.document,
@@ -61,12 +64,13 @@ export class PaymentsController {
                 acceptUntilDaysAfterDue: dto.boleto.acceptUntilDaysAfterDue,
               }
             : undefined,
-          card: dto.card
-            ? { token: dto.card.token, installments: dto.card.installments ?? 1, capture: dto.card.capture ?? true, softDescriptor: dto.card.softDescriptor }
-            : undefined,
+          card:
+            dto.method === 'CREDIT_CARD' || dto.card
+              ? { mode: dto.card?.mode ?? 'HOSTED_LINK', maxInstallments: dto.card?.maxInstallments ?? 1, softDescriptor: dto.card?.softDescriptor }
+              : undefined,
           metadata: dto.metadata,
         });
-        return { statusCode: 201, body: view, transactionId: view.id };
+        return { statusCode: created ? 201 : 200, body: { ...view, reused: !created }, transactionId: view.id };
       },
     );
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');

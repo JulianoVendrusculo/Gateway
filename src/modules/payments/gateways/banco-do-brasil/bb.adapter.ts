@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PaymentMethod, PaymentProvider, ProviderEnvironment, TransactionStatus } from '@prisma/client';
 import { z } from 'zod';
-import { ConvenioMisconfiguredError, UnsupportedPaymentMethodError, ValidationError } from '../../../../common/errors';
+import { BankIntegrationError, BankRejectedError, ConvenioMisconfiguredError, UnsupportedPaymentMethodError, ValidationError } from '../../../../common/errors';
 import { formatCivilDate, parseBrDate } from '../../../../common/utils/date-helpers';
 import { centsToDecimalString, decimalToCents } from '../../../../common/utils/money';
 import { onlyDigits, toBankSafeText } from '../../../../common/utils/text';
@@ -9,6 +9,7 @@ import { isNumericDocument } from '../../../../common/validation/brazilian-docum
 import { digitableLineToBarcode, isValidDigitableLine } from '../../boleto/boleto-barcode';
 import {
   BoletoChargeRequest,
+  CancelResult,
   ChargeReference,
   ChargeRequest,
   ChargeResult,
@@ -21,7 +22,7 @@ import {
   ValidatedConvenioConfig,
 } from '../../domain/payment-gateway.port';
 import { authorizedRequest } from '../shared/authorized-request';
-import { BacenPixClient, mapCobWithData, parseBacenPixWebhook, pixDataFromCob } from '../shared/bacen-pix.client';
+import { BacenPixClient, cancelCob, mapCobWithData, parseBacenPixWebhook, pixDataFromCob } from '../shared/bacen-pix.client';
 import { parseBankJson } from '../shared/bank-response';
 import { assertNoProblems, parseConvenioPart } from '../shared/convenio-validation';
 import { OAuth2TokenProvider } from '../shared/oauth2-token.provider';
@@ -106,7 +107,7 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
     }
   }
 
-  async getChargeStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
+  async getStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
     const settings = this.settings(ctx);
     if (ref.method === PaymentMethod.PIX) {
       const cob = await this.pixClient(ctx, settings).getCob(ref.providerReference);
@@ -139,18 +140,67 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
             }
           : undefined;
       if (BB_PAID_STATES.has(state)) {
+        // A consulta do título não identifica cada liquidação: um segundo pagamento do mesmo boleto
+        // só é percebido pelo webhook de baixa operacional (ver parseWebhook).
         return {
-          status: TransactionStatus.PAID,
+          status: TransactionStatus.CONFIRMADA,
           providerStatus: `ESTADO_${state}`,
           providerData,
-          paidAmountCents: body.valorPagoSacado !== undefined ? decimalToCents(body.valorPagoSacado) : undefined,
-          paidAt: parseBrDate(body.dataRecebimentoTitulo ?? '') ?? parseBrDate(body.dataCreditoLiquidacao ?? ''),
+          payments: [
+            {
+              amountCents: body.valorPagoSacado !== undefined ? decimalToCents(body.valorPagoSacado) : undefined,
+              paidAt: parseBrDate(body.dataRecebimentoTitulo ?? '') ?? parseBrDate(body.dataCreditoLiquidacao ?? ''),
+            },
+          ],
         };
       }
-      if (BB_WRITTEN_OFF_STATES.has(state)) return { status: TransactionStatus.CANCELED, providerStatus: `ESTADO_${state}`, providerData };
-      return { status: TransactionStatus.PENDING, providerStatus: `ESTADO_${state}`, providerData };
+      if (BB_WRITTEN_OFF_STATES.has(state)) return { status: TransactionStatus.CANCELADA, providerStatus: `ESTADO_${state}`, providerData };
+      return { status: TransactionStatus.PENDENTE, providerStatus: `ESTADO_${state}`, providerData };
     }
     throw new UnsupportedPaymentMethodError(PROVIDER, ref.method);
+  }
+
+  async cancel(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult> {
+    if (ref.method === PaymentMethod.PIX) return cancelCob(this.pixClient(ctx, this.settings(ctx)), ref.providerReference);
+    if (ref.method === PaymentMethod.BOLETO) return this.cancelBoleto(ctx, ref);
+    throw new UnsupportedPaymentMethodError(PROVIDER, ref.method);
+  }
+
+  /**
+   * Baixa (cancelamento) do boleto: POST /boletos/{id}/baixar, com o número do convênio no corpo.
+   *
+   * TODO(homologação BB): a operação consta da API Cobranças v2, mas o corpo da requisição, os códigos
+   * de erro e o comportamento para boleto recém-pago (pago hoje em outro banco, ainda em compensação)
+   * NÃO foram conferidos na referência oficial nesta entrega. Por isso nada aqui é presumido:
+   *  - resposta 2xx só indica que o pedido foi aceito; quem confirma a baixa é getStatus() (estado 7);
+   *  - qualquer recusa é classificada consultando o título, nunca pelo código de erro.
+   */
+  private async cancelBoleto(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult> {
+    const settings = this.settings(ctx);
+    const urls = resolveBbUrls(ctx.environment, settings);
+    try {
+      await authorizedRequest(ctx.http, (force) => this.token(ctx, urls.oauth, BB_SCOPES.cobranca, force), {
+        method: 'POST',
+        url: `${urls.cobranca}/boletos/${encodeURIComponent(ref.providerReference)}/baixar`,
+        operation: 'boleto.cancel',
+        query: { 'gw-dev-app-key': ctx.credentials.developerAppKey },
+        json: { numeroConvenio: settings.numeroConvenio },
+        idempotent: false,
+      });
+      return { outcome: 'CANCELED', providerStatus: 'BAIXA_SOLICITADA' };
+    } catch (err) {
+      if (!(err instanceof BankIntegrationError)) throw err;
+      if (!(err instanceof BankRejectedError)) return { outcome: 'TECHNICAL_ERROR', error: err };
+      try {
+        const current = await this.getStatus(ctx, ref);
+        if (current.status === TransactionStatus.CONFIRMADA) return { outcome: 'ALREADY_PAID', providerStatus: current.providerStatus, payments: current.payments };
+        if (current.status === TransactionStatus.CANCELADA) return { outcome: 'CANCELED', providerStatus: current.providerStatus };
+        return { outcome: 'REFUSED', providerStatus: current.providerStatus, reason: err.bankMessage };
+      } catch (lookupErr) {
+        if (lookupErr instanceof BankIntegrationError) return { outcome: 'TECHNICAL_ERROR', error: lookupErr };
+        throw lookupErr;
+      }
+    }
   }
 
   parseWebhook(payload: unknown): NormalizedWebhookEvent[] {
@@ -164,6 +214,11 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
       // 1 = baixa operacional BB, 2 = baixa operacional outro banco, 10 = cancelamento da baixa
       type: item.codigoEstadoBaixaOperacional === 10 ? 'UNKNOWN' : 'BOLETO_PAID',
       providerReference: item.id,
+      // TODO(homologação BB): confirmar qual campo identifica cada liquidação. Usamos data e hora da
+      // liquidação: duas notificações do mesmo título com horários diferentes são tratadas como dois
+      // pagamentos (o segundo vira PAGO_DUPLICADO, sem estorno automático). Sem dataLiquidacao não há
+      // como distinguir, e o evento é tratado como repetição do mesmo pagamento.
+      ...(item.dataLiquidacao && item.codigoEstadoBaixaOperacional !== 10 ? { paymentId: `boleto:${item.id}:${item.dataLiquidacao}` } : {}),
       amountCents: item.valorPagoSacado !== undefined ? decimalToCents(item.valorPagoSacado) : undefined,
       ...(item.numeroConvenio !== undefined ? { convenioHint: { settingsKey: 'numeroConvenio', value: item.numeroConvenio } } : {}),
       // Sem dados do portador (PII) na trilha de auditoria.
@@ -192,7 +247,7 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
     });
 
     const { pix, expiresAt } = pixDataFromCob(PROVIDER, cob, { name: settings.pixMerchantName, city: settings.pixMerchantCity });
-    return { status: TransactionStatus.PENDING, providerReference: cob.txid, providerData: { pix }, expiresAt };
+    return { status: TransactionStatus.PENDENTE, providerReference: cob.txid, providerData: { pix }, expiresAt };
   }
 
   // ---------------------------------------------------------------------------
@@ -269,7 +324,7 @@ export class BancoDoBrasilAdapter implements IPaymentGateway {
     }
 
     return {
-      status: TransactionStatus.PENDING,
+      status: TransactionStatus.PENDENTE,
       providerReference: created.numero,
       providerData: {
         boleto: {

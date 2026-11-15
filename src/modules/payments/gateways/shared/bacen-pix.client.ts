@@ -2,13 +2,20 @@ import { TransactionStatus } from '@prisma/client';
 import { z } from 'zod';
 import { decimalToCents } from '../../../../common/utils/money';
 import { BankHttpClient, BankHttpResponse, HttpMethod } from '../../../../infra/http/bank-http-client';
-import { BankInvalidResponseError } from '../../../../common/errors';
-import { ChargeStatusResult, NormalizedWebhookEvent, PixData } from '../../domain/payment-gateway.port';
+import { BankIntegrationError, BankInvalidResponseError, BankRejectedError } from '../../../../common/errors';
+import { CancelResult, ChargeStatusResult, NormalizedWebhookEvent, PixData, ProviderPayment } from '../../domain/payment-gateway.port';
 import { buildDynamicPixBrCode, isValidBrCode } from '../../pix/pix-brcode';
 import { authorizedRequest, TokenSupplier } from './authorized-request';
 import { parseBankJson } from './bank-response';
 
-// API Pix padronizada pelo BACEN (https://bacen.github.io/pix-api) — implementada por todos os PSPs.
+// API Pix padronizada pelo BACEN (https://github.com/bacen/pix-api, openapi.yaml) — implementada por todos os PSPs.
+// Pontos da especificação em que a v2 se apoia:
+//  - PATCH /cob/{txid} ("Revisar cobrança imediata", escopo cob.write) aceita `status` com o único valor
+//    REMOVIDA_PELO_USUARIO_RECEBEDOR, e ele precisa ir SOZINHO no corpo.
+//  - Se a cobrança não estiver ATIVA, o PATCH responde 400 CobOperacaoInvalida ("A cobrança não está ATIVA,
+//    e a presente requisição busca alterá-la"), sem dizer se foi paga ou removida: é preciso consultar.
+//  - CONCLUIDA: "já foi paga e, por conseguinte, não pode acolher outro pagamento".
+//  - O status é do REGISTRO: cobrança vencida continua ATIVA. A expiração vem de calendario.
 
 export interface CobRequest {
   calendario: { expiracao: number };
@@ -67,6 +74,16 @@ export class BacenPixClient {
     return parseBankJson(this.o.provider, 'pix.cob.get', res, cobResponseSchema);
   }
 
+  /**
+   * PATCH /cob/{txid} com status REMOVIDA_PELO_USUARIO_RECEBEDOR. Pode ser repetido com segurança:
+   * se a primeira tentativa surtiu efeito e a resposta se perdeu, a repetição recebe 400 e a
+   * consulta seguinte mostra a cobrança já removida.
+   */
+  async removeCob(txid: string): Promise<CobResponse> {
+    const res = await this.call('PATCH', `/cob/${encodeURIComponent(txid)}`, 'pix.cob.remove', { status: 'REMOVIDA_PELO_USUARIO_RECEBEDOR' });
+    return parseBankJson(this.o.provider, 'pix.cob.remove', res, cobResponseSchema);
+  }
+
   private call(method: HttpMethod, path: string, operation: string, json?: unknown): Promise<BankHttpResponse> {
     return authorizedRequest(this.o.http, this.o.getToken, {
       method,
@@ -107,29 +124,53 @@ export function mapCobWithData(provider: string, cob: CobResponse, merchant: { n
   }
 }
 
-/** Mapeia o status da cobrança Pix (padrão BACEN) para o status do gateway. */
+/** Mapeia o status do registro da cobrança Pix (padrão BACEN) para a situação da tentativa. */
 export function mapCobStatus(cob: CobResponse, now: Date = new Date()): ChargeStatusResult {
   switch (cob.status) {
-    case 'CONCLUIDA': {
-      const payments = cob.pix ?? [];
-      const paid = payments.length > 0 ? payments.reduce((sum, p) => sum + decimalToCents(p.valor), 0) : decimalToCents(cob.valor.original);
-      return {
-        status: TransactionStatus.PAID,
-        providerStatus: cob.status,
-        paidAmountCents: paid,
-        paidAt: payments[0] ? new Date(payments[0].horario) : now,
-      };
-    }
+    case 'CONCLUIDA':
+      return { status: TransactionStatus.CONFIRMADA, providerStatus: cob.status, payments: paymentsOf(cob) };
     case 'REMOVIDA_PELO_USUARIO_RECEBEDOR':
     case 'REMOVIDA_PELO_PSP':
-      return { status: TransactionStatus.CANCELED, providerStatus: cob.status };
+      return { status: TransactionStatus.CANCELADA, providerStatus: cob.status };
     case 'ATIVA': {
       const expiresAt = new Date(new Date(cob.calendario.criacao).getTime() + cob.calendario.expiracao * 1000);
-      return { status: expiresAt < now ? TransactionStatus.EXPIRED : TransactionStatus.PENDING, providerStatus: cob.status };
+      return { status: expiresAt < now ? TransactionStatus.EXPIRADA : TransactionStatus.PENDENTE, providerStatus: cob.status };
     }
     default:
-      return { status: TransactionStatus.PENDING, providerStatus: cob.status };
+      return { status: TransactionStatus.PENDENTE, providerStatus: cob.status };
   }
+}
+
+function paymentsOf(cob: CobResponse): ProviderPayment[] {
+  const received = cob.pix ?? [];
+  if (received.length === 0) return [{ amountCents: decimalToCents(cob.valor.original) }];
+  return received.map((p) => ({ id: p.endToEndId, amountCents: decimalToCents(p.valor), paidAt: new Date(p.horario) }));
+}
+
+/**
+ * Cancela uma cobrança Pix. O 400 do PATCH não distingue "já paga" de "já removida",
+ * então a classificação vem sempre de uma consulta ao registro.
+ */
+export async function cancelCob(client: BacenPixClient, txid: string): Promise<CancelResult> {
+  try {
+    return classifyAfterRemoval(await client.removeCob(txid));
+  } catch (err) {
+    if (!(err instanceof BankIntegrationError)) throw err;
+    if (!(err instanceof BankRejectedError)) return { outcome: 'TECHNICAL_ERROR', error: err };
+    try {
+      return classifyAfterRemoval(await client.getCob(txid), err.bankMessage);
+    } catch (lookupErr) {
+      if (lookupErr instanceof BankIntegrationError) return { outcome: 'TECHNICAL_ERROR', error: lookupErr };
+      throw lookupErr;
+    }
+  }
+}
+
+function classifyAfterRemoval(cob: CobResponse, reason?: string): CancelResult {
+  const current = mapCobStatus(cob);
+  if (current.status === TransactionStatus.CONFIRMADA) return { outcome: 'ALREADY_PAID', providerStatus: cob.status, payments: current.payments };
+  if (current.status === TransactionStatus.CANCELADA) return { outcome: 'CANCELED', providerStatus: cob.status };
+  return { outcome: 'REFUSED', providerStatus: cob.status, reason };
 }
 
 const pixWebhookSchema = z.object({ pix: z.array(pixPaymentSchema.extend({ txid: z.string().optional() })) });
@@ -144,6 +185,7 @@ export function parseBacenPixWebhook(payload: unknown): NormalizedWebhookEvent[]
       eventKey: `pix:${p.endToEndId}`,
       type: 'PIX_RECEIVED' as const,
       providerReference: p.txid!,
+      paymentId: p.endToEndId,
       amountCents: decimalToCents(p.valor),
       occurredAt: new Date(p.horario),
       raw: { endToEndId: p.endToEndId, txid: p.txid, valor: p.valor, horario: p.horario },

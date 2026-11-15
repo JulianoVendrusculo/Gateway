@@ -75,3 +75,11 @@ export function formatCivilDate(date: Date, pattern: string): string {
 export function diffInDays(from: Date, to: Date): number {
   return Math.round((to.getTime() - from.getTime()) / 86_400_000);
 }
+
+/**
+ * Último instante de uma data civil no horário de Brasília (23:59:59.999, UTC-3).
+ * O Brasil não adota horário de verão desde 2019, por isso o deslocamento é fixo.
+ */
+export function endOfCivilDayBr(civilDate: Date): Date {
+  return new Date(civilDate.getTime() + 86_400_000 + 3 * 3_600_000 - 1);
+}

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PaymentMethod, PaymentProvider, TransactionStatus } from '@prisma/client';
-import { BankInvalidResponseError, ConvenioMisconfiguredError, UnsupportedPaymentMethodError, ValidationError } from '../../../../common/errors';
+import { BankIntegrationError, BankInvalidResponseError, BankRejectedError, ConvenioMisconfiguredError, UnsupportedPaymentMethodError, ValidationError } from '../../../../common/errors';
 import { formatCivilDate } from '../../../../common/utils/date-helpers';
 import { centsToDecimalString } from '../../../../common/utils/money';
 import { onlyDigits, removeAccents, toBankSafeText } from '../../../../common/utils/text';
@@ -8,6 +8,7 @@ import { isNumericDocument } from '../../../../common/validation/brazilian-docum
 import { digitableLineToBarcode, isValidDigitableLine } from '../../boleto/boleto-barcode';
 import {
   BoletoChargeRequest,
+  CancelResult,
   ChargeReference,
   ChargeRequest,
   ChargeResult,
@@ -20,11 +21,11 @@ import {
   ProviderData,
   ValidatedConvenioConfig,
 } from '../../domain/payment-gateway.port';
-import { BacenPixClient, mapCobWithData, parseBacenPixWebhook, pixDataFromCob } from '../shared/bacen-pix.client';
+import { BacenPixClient, cancelCob, mapCobWithData, parseBacenPixWebhook, pixDataFromCob } from '../shared/bacen-pix.client';
 import { assertNoProblems, parseConvenioPart } from '../shared/convenio-validation';
 import { OAuth2TokenProvider } from '../shared/oauth2-token.provider';
 import { CAIXA_SIBAR_DEFAULT_URLS, CaixaSettings, caixaCredentialsSchema, caixaSettingsSchema } from './caixa.config';
-import { CaixaSibarClient, SibarResult, buildConsultaBoletoXml, buildIncluiBoletoXml, findSibarText, sibarAuthHash } from './caixa-sibar.client';
+import { CaixaSibarClient, SibarResult, buildBaixaBoletoXml, buildConsultaBoletoXml, buildIncluiBoletoXml, findSibarText, sibarAuthHash } from './caixa-sibar.client';
 
 const PROVIDER = PaymentProvider.CAIXA;
 
@@ -42,20 +43,22 @@ export const SITUACAO_DESCONHECIDA = 'DESCONHECIDA';
 /**
  * Interpreta o CONSULTA_BOLETO do SIGCB. A situação do título chega no texto de retorno, por exemplo
  * "(0) OPERACAO EFETUADA - SITUACAO DO TITULO = EM ABERTO"; o separador varia entre versões do leiaute.
- * Só vira PAID com indicação explícita de liquidação: na dúvida o título continua PENDING.
+ * Só vira CONFIRMADA com indicação explícita de liquidação: na dúvida o título continua PENDENTE.
+ * A consulta não identifica cada liquidação, então um segundo pagamento do mesmo boleto não é
+ * detectável por aqui (depende do arquivo de retorno).
  */
 export function mapConsultaBoleto(result: SibarResult, nossoNumero: string): ChargeStatusResult {
   const situacao =
     result.messages.map((m) => SITUACAO.exec(removeAccents(m).toUpperCase())?.[1]?.trim()).find((s) => !!s)?.slice(0, 60) ?? SITUACAO_DESCONHECIDA;
   const providerData = boletoFromConsulta(result, nossoNumero);
-  const withData = (status: TransactionStatus): ChargeStatusResult => ({ status, providerStatus: situacao, ...(providerData ? { providerData } : {}) });
+  const withData = (status: ChargeStatusResult['status']): ChargeStatusResult => ({ status, providerStatus: situacao, ...(providerData ? { providerData } : {}) });
 
-  if (/\bNAO\b/.test(situacao)) return withData(TransactionStatus.PENDING);
+  if (/\bNAO\b/.test(situacao)) return withData(TransactionStatus.PENDENTE);
   // LIQUIDADO, LIQUIDADO NO CARTORIO, TITULO JA PAGO NO DIA
-  if (/LIQUIDAD|\bPAGO\b/.test(situacao)) return withData(TransactionStatus.PAID);
+  if (/LIQUIDAD|\bPAGO\b/.test(situacao)) return { ...withData(TransactionStatus.CONFIRMADA), payments: [{}] };
   // BAIXA POR DEVOLUCAO, BAIXA POR ESTORNO, BAIXA POR PROTESTO, BAIXADO
-  if (/^BAIXA/.test(situacao)) return withData(TransactionStatus.CANCELED);
-  return withData(TransactionStatus.PENDING);
+  if (/^BAIXA/.test(situacao)) return withData(TransactionStatus.CANCELADA);
+  return withData(TransactionStatus.PENDENTE);
 }
 
 /**
@@ -119,7 +122,7 @@ export class CaixaAdapter implements IPaymentGateway {
     }
   }
 
-  async getChargeStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
+  async getStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
     const settings = this.settings(ctx);
     if (ref.method === PaymentMethod.PIX) {
       const cob = await this.pixClient(ctx, settings).getCob(ref.providerReference);
@@ -135,12 +138,45 @@ export class CaixaAdapter implements IPaymentGateway {
       const result = await new CaixaSibarClient(ctx.http).call(this.urls(ctx, settings).sibarConsulta, 'ConsultaBoleto', xml, 'boleto.get', true);
       const status = mapConsultaBoleto(result, ref.providerReference);
       if (status.providerStatus === SITUACAO_DESCONHECIDA) {
-        // Sem isto um título pago ficaria PENDING em silêncio: o texto precisa ser mapeado na homologação.
+        // Sem isto um título pago ficaria PENDENTE em silêncio: o texto precisa ser mapeado na homologação.
         this.logger.warn({ msg: 'caixa boleto status not recognized', transactionId: ref.transactionId, messages: result.messages.map((m) => m.slice(0, 120)) });
       }
       return status;
     }
     throw new UnsupportedPaymentMethodError(PROVIDER, ref.method);
+  }
+
+  async cancel(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult> {
+    if (ref.method === PaymentMethod.PIX) return cancelCob(this.pixClient(ctx, this.settings(ctx)), ref.providerReference);
+    if (ref.method === PaymentMethod.BOLETO) return this.cancelBoleto(ctx, ref);
+    throw new UnsupportedPaymentMethodError(PROVIDER, ref.method);
+  }
+
+  /**
+   * Baixa do boleto pelo BAIXA_BOLETO do SIGCB (ver o TODO em buildBaixaBoletoXml).
+   * Retorno com COD_RETORNO zero só indica que o pedido foi aceito: quem confirma a baixa é
+   * getStatus(). Qualquer recusa é classificada consultando o título, nunca pelo código de erro.
+   */
+  private async cancelBoleto(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult> {
+    const settings = this.settings(ctx);
+    const auth = sibarAuthHash({ codigoBeneficiario: settings.codigoBeneficiario, nossoNumero: ref.providerReference, beneficiaryDocument: ctx.beneficiary.document });
+    const xml = buildBaixaBoletoXml(this.header(settings, auth, 'BAIXA_BOLETO'), settings.codigoBeneficiario, ref.providerReference);
+    try {
+      await new CaixaSibarClient(ctx.http).call(this.urls(ctx, settings).sibarManutencao, 'BaixaBoleto', xml, 'boleto.cancel', false);
+      return { outcome: 'CANCELED', providerStatus: 'BAIXA_SOLICITADA' };
+    } catch (err) {
+      if (!(err instanceof BankIntegrationError)) throw err;
+      if (!(err instanceof BankRejectedError)) return { outcome: 'TECHNICAL_ERROR', error: err };
+      try {
+        const current = await this.getStatus(ctx, ref);
+        if (current.status === TransactionStatus.CONFIRMADA) return { outcome: 'ALREADY_PAID', providerStatus: current.providerStatus, payments: current.payments };
+        if (current.status === TransactionStatus.CANCELADA) return { outcome: 'CANCELED', providerStatus: current.providerStatus };
+        return { outcome: 'REFUSED', providerStatus: current.providerStatus, reason: err.bankMessage };
+      } catch (lookupErr) {
+        if (lookupErr instanceof BankIntegrationError) return { outcome: 'TECHNICAL_ERROR', error: lookupErr };
+        throw lookupErr;
+      }
+    }
   }
 
   /**
@@ -158,6 +194,7 @@ export class CaixaAdapter implements IPaymentGateway {
         eventKey: `boleto:${String(i.nossoNumero)}:${typeof i.dataPagamento === 'string' ? i.dataPagamento : 'notificacao'}`,
         type: 'BOLETO_PAID' as const,
         providerReference: String(i.nossoNumero),
+        ...(typeof i.dataPagamento === 'string' ? { paymentId: `boleto:${String(i.nossoNumero)}:${i.dataPagamento}` } : {}),
         ...(typeof i.codigoBeneficiario === 'string' ? { convenioHint: { settingsKey: 'codigoBeneficiario', value: i.codigoBeneficiario } } : {}),
         raw: { nossoNumero: i.nossoNumero, dataPagamento: i.dataPagamento },
       }));
@@ -180,7 +217,7 @@ export class CaixaAdapter implements IPaymentGateway {
       ...(req.description ? { solicitacaoPagador: req.description.slice(0, 140) } : {}),
     });
     const { pix, expiresAt } = pixDataFromCob(PROVIDER, cob, { name: settings.pixMerchantName, city: settings.pixMerchantCity });
-    return { status: TransactionStatus.PENDING, providerReference: cob.txid, providerData: { pix }, expiresAt };
+    return { status: TransactionStatus.PENDENTE, providerReference: cob.txid, providerData: { pix }, expiresAt };
   }
 
   private async createBoleto(ctx: GatewayContext, req: BoletoChargeRequest): Promise<ChargeResult> {
@@ -234,7 +271,7 @@ export class CaixaAdapter implements IPaymentGateway {
     }
     const bankNossoNumero = typeof inclui.NOSSO_NUMERO === 'string' && inclui.NOSSO_NUMERO ? inclui.NOSSO_NUMERO : nossoNumero;
     return {
-      status: TransactionStatus.PENDING,
+      status: TransactionStatus.PENDENTE,
       providerReference: bankNossoNumero,
       providerData: {
         boleto: {
@@ -249,7 +286,7 @@ export class CaixaAdapter implements IPaymentGateway {
     };
   }
 
-  private header(settings: CaixaSettings, autenticacao: string, operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO') {
+  private header(settings: CaixaSettings, autenticacao: string, operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO' | 'BAIXA_BOLETO') {
     return {
       versao: settings.versaoLeiaute,
       autenticacao,

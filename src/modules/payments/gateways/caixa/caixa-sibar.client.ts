@@ -33,7 +33,7 @@ export interface SibarHeaderInput {
   versao: string;
   autenticacao: string;
   usuarioServico: string;
-  operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO';
+  operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO' | 'BAIXA_BOLETO';
   sistemaOrigem: string;
   unidade: string;
   now?: Date;
@@ -128,6 +128,20 @@ export function buildConsultaBoletoXml(h: SibarHeaderInput, codigoBeneficiario: 
   return envelope(
     NS_CONSULTA,
     header(h) + `<DADOS><CONSULTA_BOLETO>${x('CODIGO_BENEFICIARIO', codigoBeneficiario)}${x('NOSSO_NUMERO', nossoNumero)}</CONSULTA_BOLETO></DADOS>`,
+  );
+}
+
+/**
+ * BAIXA_BOLETO: pede a baixa (cancelamento) do título, no serviço de manutenção.
+ *
+ * TODO(homologação Caixa): a operação existe no webservice SIGCB, mas a estrutura abaixo
+ * (CODIGO_BENEFICIARIO + NOSSO_NUMERO, hash com vencimento e valor zerados, como na consulta)
+ * NÃO foi conferida no manual oficial nesta entrega. Validar com o kit de homologação antes de produção.
+ */
+export function buildBaixaBoletoXml(h: SibarHeaderInput, codigoBeneficiario: string, nossoNumero: string): string {
+  return envelope(
+    NS_MANUTENCAO,
+    header(h) + `<DADOS><BAIXA_BOLETO>${x('CODIGO_BENEFICIARIO', codigoBeneficiario)}${x('NOSSO_NUMERO', nossoNumero)}</BAIXA_BOLETO></DADOS>`,
   );
 }
 

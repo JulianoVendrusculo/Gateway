@@ -91,7 +91,7 @@ describe('BancoDoBrasilAdapter', () => {
     });
 
     expect(sentBody).toMatchObject({ valor: { original: '150.50' }, chave: 'pix@loja.com', devedor: { cpf: '52998224725' } });
-    expect(result.status).toBe(TransactionStatus.PENDING);
+    expect(result.status).toBe(TransactionStatus.PENDENTE);
     expect(result.providerReference).toBe('TXID123');
     expect(isValidBrCode(result.providerData.pix!.copyPaste)).toBe(true);
     expect(result.expiresAt?.toISOString()).toBe('2026-10-30T13:00:00.000Z');
@@ -109,21 +109,21 @@ describe('BancoDoBrasilAdapter', () => {
       valor: { original: '10.00' },
       pix: [{ endToEndId: 'E1', txid: 'T1', valor: '10.00', horario: '2026-10-30T12:05:00Z' }],
     });
-    const status = await adapter.getChargeStatus(ctx, {
+    const status = await adapter.getStatus(ctx, {
       transactionId: 't',
       method: PaymentMethod.PIX,
       providerReference: 'T1',
       amountCents: 1000,
       createdAt: new Date(),
     });
-    expect(status).toMatchObject({ status: TransactionStatus.PAID, paidAmountCents: 1000 });
+    expect(status).toMatchObject({ status: TransactionStatus.CONFIRMADA, payments: [{ id: 'E1', amountCents: 1000 }] });
   });
 
   it('falha de OAuth vira BankAuthenticationError', async () => {
     const { agent, ctx, adapter } = setup();
     agent.get(OAUTH).intercept({ path: '/oauth/token', method: 'POST' }).reply(401, { error: 'invalid_client', error_description: 'bad' });
     await expect(
-      adapter.getChargeStatus(ctx, { transactionId: 't', method: PaymentMethod.PIX, providerReference: 'X', amountCents: 1, createdAt: new Date() }),
+      adapter.getStatus(ctx, { transactionId: 't', method: PaymentMethod.PIX, providerReference: 'X', amountCents: 1, createdAt: new Date() }),
     ).rejects.toBeInstanceOf(BankAuthenticationError);
   });
 
@@ -194,14 +194,14 @@ describe('BancoDoBrasilAdapter', () => {
           dataRecebimentoTitulo: '00.00.0000',
           dataCreditoLiquidacao: '16.11.2026',
         });
-      const status = await adapter.getChargeStatus(ctx, {
+      const status = await adapter.getStatus(ctx, {
         transactionId: 't',
         method: PaymentMethod.BOLETO,
         providerReference: '00031285570000000001',
         amountCents: 15050,
         createdAt: new Date(),
       });
-      expect(status).toMatchObject({ status: TransactionStatus.PAID, paidAmountCents: 15050, paidAt: parseIsoDate('2026-11-16') });
+      expect(status).toMatchObject({ status: TransactionStatus.CONFIRMADA, payments: [{ amountCents: 15050, paidAt: parseIsoDate('2026-11-16') }] });
       expect(status.providerData?.boleto).toMatchObject({ barcode, dueDate: '2026-11-15', issueDate: '2026-11-15' });
     });
 
@@ -216,14 +216,91 @@ describe('BancoDoBrasilAdapter', () => {
     });
   });
 
+  describe('cancelamento', () => {
+    const cob = (status: string, extra: object = {}) => ({ txid: 'T1', status, calendario: { criacao: '2026-10-30T12:00:00Z', expiracao: 3600 }, valor: { original: '10.00' }, ...extra });
+    const pixRef = { transactionId: 't', method: PaymentMethod.PIX, providerReference: 'T1', amountCents: 1000, createdAt: new Date() };
+    const boletoRef = { transactionId: 't', method: PaymentMethod.BOLETO, providerReference: '00031285570000000001', amountCents: 15050, createdAt: new Date() };
+    const boletoPath = (suffix: string) => (p: string) => p.startsWith(`/cobrancas/v2/boletos/00031285570000000001${suffix}?`);
+
+    it('Pix: remove a cobrança com PATCH e status REMOVIDA_PELO_USUARIO_RECEBEDOR sozinho no corpo', async () => {
+      const { agent, ctx, adapter } = setup();
+      mockToken(agent);
+      let sent: unknown;
+      agent
+        .get(API)
+        .intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'PATCH' })
+        .reply(200, (opts) => {
+          sent = JSON.parse(String(opts.body));
+          return cob('REMOVIDA_PELO_USUARIO_RECEBEDOR');
+        });
+      expect(await adapter.cancel(ctx, pixRef)).toEqual({ outcome: 'CANCELED', providerStatus: 'REMOVIDA_PELO_USUARIO_RECEBEDOR' });
+      expect(sent).toEqual({ status: 'REMOVIDA_PELO_USUARIO_RECEBEDOR' });
+    });
+
+    it('Pix: o 400 do PATCH não diz se foi paga; a consulta mostra CONCLUIDA e o resultado é ALREADY_PAID', async () => {
+      const { agent, ctx, adapter } = setup();
+      mockToken(agent);
+      const api = agent.get(API);
+      api.intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'PATCH' }).reply(400, { type: 'https://pix.bcb.gov.br/api/v2/error/CobOperacaoInvalida', title: 'Cobrança inválida.', status: 400 });
+      api.intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'GET' }).reply(200, cob('CONCLUIDA', { pix: [{ endToEndId: 'E1', txid: 'T1', valor: '10.00', horario: '2026-10-30T12:05:00Z' }] }));
+      expect(await adapter.cancel(ctx, pixRef)).toMatchObject({ outcome: 'ALREADY_PAID', providerStatus: 'CONCLUIDA', payments: [{ id: 'E1', amountCents: 1000 }] });
+    });
+
+    it('Pix: recusa com a cobrança ainda ATIVA é REFUSED; falha de transporte é TECHNICAL_ERROR', async () => {
+      const refused = setup();
+      mockToken(refused.agent);
+      const api = refused.agent.get(API);
+      api.intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'PATCH' }).reply(400, { title: 'Cobrança inválida.', status: 400, detail: 'recusada' });
+      api.intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'GET' }).reply(200, cob('ATIVA', { calendario: { criacao: new Date().toISOString(), expiracao: 3600 } }));
+      expect(await refused.adapter.cancel(refused.ctx, pixRef)).toMatchObject({ outcome: 'REFUSED', providerStatus: 'ATIVA' });
+
+      const down = setup();
+      mockToken(down.agent);
+      down.agent.get(API).intercept({ path: (p) => p.startsWith('/pix/v2/cob/T1'), method: 'PATCH' }).reply(503, 'unavailable').times(3);
+      const result = await down.adapter.cancel(down.ctx, pixRef);
+      expect(result.outcome).toBe('TECHNICAL_ERROR');
+      expect(result.outcome === 'TECHNICAL_ERROR' && result.error).toBeInstanceOf(BankUnavailableError);
+    });
+
+    it('boleto: pede a baixa com o número do convênio; o aceite ainda depende de confirmação por getStatus', async () => {
+      const { agent, ctx, adapter } = setup();
+      mockToken(agent);
+      let sent: unknown;
+      agent
+        .get(API)
+        .intercept({ path: boletoPath('/baixar'), method: 'POST' })
+        .reply(200, (opts) => {
+          sent = JSON.parse(String(opts.body));
+          return { numeroContratoCobranca: '1', dataBaixa: '30.10.2026', horarioBaixa: '12:00:00' };
+        });
+      expect(await adapter.cancel(ctx, boletoRef)).toEqual({ outcome: 'CANCELED', providerStatus: 'BAIXA_SOLICITADA' });
+      expect(sent).toEqual({ numeroConvenio: 3128557 });
+    });
+
+    it('boleto: baixa recusada é classificada pela consulta do título (pago, baixado ou ainda em aberto)', async () => {
+      for (const [estado, expected] of [
+        [6, { outcome: 'ALREADY_PAID', providerStatus: 'ESTADO_6' }],
+        [7, { outcome: 'CANCELED', providerStatus: 'ESTADO_7' }],
+        [1, { outcome: 'REFUSED', providerStatus: 'ESTADO_1', reason: 'Título não pode ser baixado' }],
+      ] as const) {
+        const { agent, ctx, adapter } = setup();
+        mockToken(agent);
+        const api = agent.get(API);
+        api.intercept({ path: boletoPath('/baixar'), method: 'POST' }).reply(400, { erros: [{ codigo: '4678420', mensagem: 'Título não pode ser baixado' }] });
+        api.intercept({ path: boletoPath(''), method: 'GET' }).reply(200, { codigoEstadoTituloCobranca: estado, valorPagoSacado: 150.5 });
+        expect(await adapter.cancel(ctx, boletoRef)).toMatchObject(expected);
+      }
+    });
+  });
+
   it('normaliza webhooks de Pix (padrão BACEN) e de baixa operacional de boleto', () => {
     const { adapter } = setup();
     expect(
       adapter.parseWebhook({ pix: [{ endToEndId: 'E00000000202610301200abc', txid: 'TX1', valor: '99.90', horario: '2026-10-30T12:00:00Z' }] }),
-    ).toEqual([expect.objectContaining({ eventKey: 'pix:E00000000202610301200abc', type: 'PIX_RECEIVED', providerReference: 'TX1', amountCents: 9990 })]);
+    ).toEqual([expect.objectContaining({ eventKey: 'pix:E00000000202610301200abc', type: 'PIX_RECEIVED', providerReference: 'TX1', paymentId: 'E00000000202610301200abc', amountCents: 9990 })]);
     expect(
       adapter.parseWebhook([{ id: '00031285570000000001', codigoEstadoBaixaOperacional: 1, dataLiquidacao: '30/10/2026 10:00:00', valorPagoSacado: 150.5, nomePortador: 'PII' }]),
-    ).toEqual([expect.objectContaining({ type: 'BOLETO_PAID', providerReference: '00031285570000000001', amountCents: 15050 })]);
+    ).toEqual([expect.objectContaining({ type: 'BOLETO_PAID', providerReference: '00031285570000000001', paymentId: 'boleto:00031285570000000001:30/10/2026 10:00:00', amountCents: 15050 })]);
     expect(adapter.parseWebhook({ foo: 'bar' })).toEqual([]);
   });
 });

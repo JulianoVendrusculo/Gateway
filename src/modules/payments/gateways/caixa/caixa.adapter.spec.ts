@@ -23,26 +23,26 @@ const status = (retorno: string) => mapConsultaBoleto(consulta(retorno), NOSSO_N
 
 describe('Caixa: situação do título no CONSULTA_BOLETO', () => {
   it('reconhece a situação com "=" ou ":" como separador', () => {
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = EM ABERTO')).toEqual({ status: TransactionStatus.PENDING, providerStatus: 'EM ABERTO' });
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO: LIQUIDADO')).toMatchObject({ status: TransactionStatus.PAID, providerStatus: 'LIQUIDADO' });
-    expect(status('(0) OPERAÇÃO EFETUADA - SITUAÇÃO DO TÍTULO = LIQUIDADO')).toMatchObject({ status: TransactionStatus.PAID });
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = EM ABERTO')).toEqual({ status: TransactionStatus.PENDENTE, providerStatus: 'EM ABERTO' });
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO: LIQUIDADO')).toMatchObject({ status: TransactionStatus.CONFIRMADA, providerStatus: 'LIQUIDADO' });
+    expect(status('(0) OPERAÇÃO EFETUADA - SITUAÇÃO DO TÍTULO = LIQUIDADO')).toMatchObject({ status: TransactionStatus.CONFIRMADA });
   });
 
   it('liquidação em cartório e título pago no dia contam como pagos', () => {
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = LIQUIDADO NO CARTORIO').status).toBe(TransactionStatus.PAID);
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = TITULO JA PAGO NO DIA').status).toBe(TransactionStatus.PAID);
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = LIQUIDADO NO CARTORIO').status).toBe(TransactionStatus.CONFIRMADA);
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = TITULO JA PAGO NO DIA').status).toBe(TransactionStatus.CONFIRMADA);
   });
 
   it('baixas viram CANCELED', () => {
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = BAIXA POR DEVOLUCAO').status).toBe(TransactionStatus.CANCELED);
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = BAIXADO').status).toBe(TransactionStatus.CANCELED);
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = BAIXA POR DEVOLUCAO').status).toBe(TransactionStatus.CANCELADA);
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = BAIXADO').status).toBe(TransactionStatus.CANCELADA);
   });
 
   it('na dúvida o título continua PENDING (nunca marca pago sem indicação explícita)', () => {
-    expect(status('(0) OPERACAO EFETUADA')).toEqual({ status: TransactionStatus.PENDING, providerStatus: 'DESCONHECIDA' });
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = ENVIADO AO CARTORIO').status).toBe(TransactionStatus.PENDING);
-    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = NAO LIQUIDADO').status).toBe(TransactionStatus.PENDING);
-    expect(status('(0) PAGAMENTO EM ANALISE').status).toBe(TransactionStatus.PENDING);
+    expect(status('(0) OPERACAO EFETUADA')).toEqual({ status: TransactionStatus.PENDENTE, providerStatus: 'DESCONHECIDA' });
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = ENVIADO AO CARTORIO').status).toBe(TransactionStatus.PENDENTE);
+    expect(status('(0) OPERACAO EFETUADA - SITUACAO DO TITULO = NAO LIQUIDADO').status).toBe(TransactionStatus.PENDENTE);
+    expect(status('(0) PAGAMENTO EM ANALISE').status).toBe(TransactionStatus.PENDENTE);
   });
 
   it('recupera os dados do boleto quando a consulta devolve linha digitável e vencimento', () => {
