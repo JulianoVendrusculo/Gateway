@@ -349,6 +349,27 @@ describe('Payment Gateway (e2e)', () => {
     });
   });
 
+  describe('convivência com dados da v1', () => {
+    it('transação criada pela v1 continua legível, e a v2 não a altera nem a concilia', async () => {
+      const payer = await h.prisma.customer.findFirstOrThrow({ where: { merchantId: merchant.id } });
+      const legacy = await h.prisma.transaction.create({
+        data: { id: randomUUID(), merchantId: merchant.id, convenioId: bbConvenioId, customerId: payer.id, method: 'PIX', provider: 'BANCO_DO_BRASIL', status: 'PENDING', amountCents: 1234, idempotencyKey: 'legado-v1-0001', providerReference: 'a'.repeat(32) },
+      });
+      expect(await h.payment(merchant, legacy.id)).toMatchObject({ status: 'PENDING', chargeId: null, amount: 1234 });
+
+      const requests = h.bank.requests.length;
+      await h.http.get(`/v1/payments/${legacy.id}?refresh=true`).set(h.auth(merchant)).expect(200);
+      const webhook = await h.pixWebhook(legacy.providerReference!, 'E-LEGADO-0001').expect(200);
+      expect(webhook.body).toMatchObject({ ignored: 1 });
+      expect(h.bank.requests.length).toBe(requests);
+      expect((await h.prisma.transaction.findUniqueOrThrow({ where: { id: legacy.id } })).status).toBe('PENDING');
+
+      // O banco de dados não deixa os dois vocabulários se misturarem.
+      await expect(h.prisma.transaction.update({ where: { id: legacy.id }, data: { status: 'PENDENTE' } })).rejects.toThrow(/transactions_status_matches_generation/);
+      await h.prisma.transaction.delete({ where: { id: legacy.id } });
+    });
+  });
+
   describe('dados em repouso', () => {
     it('nenhum segredo/PII em claro nas tabelas', async () => {
       const dump = JSON.stringify(
