@@ -51,11 +51,19 @@ export function parseIsoDate(value: string): Date {
   return d;
 }
 
-/** Converte "dd.MM.yyyy" ou "dd/MM/yyyy" (formatos do BB) -> Date UTC. */
+/**
+ * Converte "dd.MM.yyyy" ou "dd/MM/yyyy" (formatos do BB, com ou sem hora) -> Date UTC.
+ * Nunca lança: o banco usa marcadores como "00.00.0000" em campos sem valor, e isso
+ * não pode derrubar a consulta de um título pago.
+ */
 export function parseBrDate(value: string): Date | undefined {
-  const m = /^(\d{2})[./](\d{2})[./](\d{4})$/.exec(value.trim());
+  const m = /^(\d{2})[./](\d{2})[./](\d{4})(?:\s|$)/.exec(value.trim());
   if (!m) return undefined;
-  return parseIsoDate(`${m[3]}-${m[2]}-${m[1]}`);
+  try {
+    return parseIsoDate(`${m[3]}-${m[2]}-${m[1]}`);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Formata data civil ("yyyy-MM-dd" em UTC) com o padrão dado, sem conversão de fuso. */
@@ -66,4 +74,12 @@ export function formatCivilDate(date: Date, pattern: string): string {
 
 export function diffInDays(from: Date, to: Date): number {
   return Math.round((to.getTime() - from.getTime()) / 86_400_000);
+}
+
+/**
+ * Último instante de uma data civil no horário de Brasília (23:59:59.999, UTC-3).
+ * O Brasil não adota horário de verão desde 2019, por isso o deslocamento é fixo.
+ */
+export function endOfCivilDayBr(civilDate: Date): Date {
+  return new Date(civilDate.getTime() + 86_400_000 + 3 * 3_600_000 - 1);
 }

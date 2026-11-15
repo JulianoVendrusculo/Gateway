@@ -3,7 +3,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
-  IsBoolean,
+  IsDate,
   IsDefined,
   IsEmail,
   IsEnum,
@@ -100,16 +100,15 @@ export class BoletoOptionsDto {
 }
 
 export class CardPaymentDto {
-  /** Token emitido pela adquirente (POST /v1/cards/tokens ou SDK client-side). O PAN nunca é aceito aqui. */
-  @IsString() @Matches(/^[A-Za-z0-9_-]{8,128}$/)
-  token!: string;
+  /**
+   * HOSTED_LINK (padrão): o pagador paga na página do banco e a confirmação chega por webhook.
+   * DIRECT é aceito pelo contrato, mas nenhum provedor o oferece ainda.
+   */
+  @IsOptional() @IsIn(['HOSTED_LINK', 'DIRECT'])
+  mode?: 'HOSTED_LINK' | 'DIRECT';
 
   @IsOptional() @IsInt() @Min(1) @Max(12)
-  installments?: number;
-
-  /** false = apenas pré-autoriza (captura posterior). */
-  @IsOptional() @IsBoolean()
-  capture?: boolean;
+  maxInstallments?: number;
 
   @IsOptional() @Matches(/^[A-Za-z0-9 ]{1,13}$/)
   softDescriptor?: string;
@@ -126,9 +125,16 @@ export class CreatePaymentDto {
   @IsOptional() @IsString() @Sanitize() @MaxLength(140)
   description?: string;
 
-  /** Identificador do pedido no sistema do lojista. */
-  @IsOptional() @Matches(/^[A-Za-z0-9_.:-]{1,64}$/)
-  externalReference?: string;
+  /**
+   * Id da inscrição no sistema do lojista. Obrigatório na v2: identifica a cobrança única.
+   * Todas as tentativas (Pix, boleto, cartão) com a mesma referência pertencem à mesma cobrança.
+   */
+  @Matches(/^[A-Za-z0-9_.:-]{1,64}$/, { message: 'externalReference é obrigatório (1 a 64 caracteres: letras, dígitos e _ . : -)' })
+  externalReference!: string;
+
+  /** Prazo da cobrança (ISO 8601). Só vale na primeira tentativa da inscrição; depois dele não se criam novas. */
+  @IsOptional() @Type(() => Date) @IsDate()
+  chargeExpiresAt?: Date;
 
   /** Força um convênio específico; se omitido, usa o de maior prioridade apto ao método. */
   @IsOptional() @IsUUID()
@@ -144,8 +150,7 @@ export class CreatePaymentDto {
   @IsDefined() @ValidateNested() @Type(() => BoletoOptionsDto)
   boleto?: BoletoOptionsDto;
 
-  @ValidateIf((o: CreatePaymentDto) => o.method === PaymentMethod.CREDIT_CARD || o.card !== undefined)
-  @IsDefined() @ValidateNested() @Type(() => CardPaymentDto)
+  @IsOptional() @ValidateNested() @Type(() => CardPaymentDto)
   card?: CardPaymentDto;
 
   @IsOptional() @IsMetadataRecord()

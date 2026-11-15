@@ -13,3 +13,8 @@ process.env.BANK_URL_ALLOWED_HOSTS = 'localhost';
 process.env.RECONCILIATION_ENABLED = 'false';
 process.env.THROTTLE_LIMIT = '10000';
 process.env.BANK_HTTP_TIMEOUT_MS = '5000';
+process.env.WEBHOOK_SECRET_MOCK_ACQUIRER = 'e2e-mock-acquirer-webhook-secret-0123456';
+// Pix sem janela de tolerância: tentativa vencida é verificada no banco e liberada na hora.
+process.env.VERIFICATION_WINDOW_PIX_SECONDS = '0';
+process.env.VERIFICATION_WINDOW_CARD_SECONDS = '1800';
+process.env.CARD_LINK_TTL_SECONDS = '900';

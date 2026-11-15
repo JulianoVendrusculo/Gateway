@@ -1,162 +1,196 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PaymentMethod, PaymentProvider, ProviderEnvironment, TransactionStatus } from '@prisma/client';
-import { createHmac, randomBytes, randomInt } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
-import { BankRejectedError, BankTimeoutError, UnsupportedPaymentMethodError } from '../../../../common/errors';
-import { isLuhnValid } from '../../../../common/validation/decorators';
+import { BankRejectedError, BankTimeoutError, BankUnavailableError, UnsupportedPaymentMethodError } from '../../../../common/errors';
 import {
-  CardChargeRequest,
-  CardTokenResult,
+  CancelResult,
+  CardMode,
   ChargeReference,
   ChargeRequest,
   ChargeResult,
   ChargeStatusResult,
   ConvenioValidationInput,
   GatewayContext,
-  ICardTokenizer,
   IPaymentGateway,
   NormalizedWebhookEvent,
-  RawCardData,
+  ProviderPayment,
   ValidatedConvenioConfig,
 } from '../../domain/payment-gateway.port';
 import { assertNoProblems, parseConvenioPart } from '../shared/convenio-validation';
 
 const PROVIDER = PaymentProvider.MOCK_ACQUIRER;
 
-const settingsSchema = z.object({ simulatedLatencyMs: z.number().int().min(0).max(5000).default(0) }).strict();
+/**
+ * Comportamentos do "banco" que ainda dependem de confirmação com BB e Caixa.
+ * Cada um é uma chave do convênio, para os testes exercitarem todos os caminhos.
+ */
+const settingsSchema = z
+  .object({
+    simulatedLatencyMs: z.number().int().min(0).max(5000).default(0),
+    /** Endereço da página de pagamento devolvido ao pagador. O gateway nunca chama esta URL. */
+    linkBaseUrl: z.string().url().default('https://pagamento.exemplo.invalid/link'),
+    /** OK: cria o link. TIMEOUT: não cria e o resultado fica incerto. */
+    createBehavior: z.enum(['OK', 'TIMEOUT']).default('OK'),
+    /**
+     * Resposta ao pedido de invalidar o link:
+     * ACCEPT invalida; UNSUPPORTED = o banco não oferece cancelamento; REFUSE recusa; ERROR = falha técnica.
+     */
+    cancelBehavior: z.enum(['ACCEPT', 'UNSUPPORTED', 'REFUSE', 'ERROR']).default('ACCEPT'),
+  })
+  .strict();
 const credentialsSchema = z.object({ acquirerToken: z.string().min(16).max(500) }).strict();
 
-interface VaultEntry {
-  brand: string;
-  last4: string;
-  expMonth: number;
-  expYear: number;
-  fingerprint: string;
-  convenioId: string;
-}
+const webhookSchema = z.object({
+  type: z.literal('payment.confirmed'),
+  reference: z.string().regex(/^lnk_[a-f0-9]{32}$/),
+  paymentId: z.string().regex(/^pay_[a-f0-9]{20}$/),
+  amountCents: z.number().int().positive(),
+  paidAt: z.string(),
+});
 
-interface MockCharge {
-  status: TransactionStatus;
+export type MockAcquirerWebhook = z.infer<typeof webhookSchema>;
+
+interface MockLink {
+  convenioId: string;
   amountCents: number;
-  paidAt?: Date;
+  expiresAt: Date;
+  canceled: boolean;
+  payments: Array<Required<ProviderPayment>>;
 }
 
 /**
- * Adquirente SIMULADA — mesma interface que uma adquirente real (Cielo, Rede, Getnet, Stone...).
+ * Provedor SIMULADO de link de pagamento com cartão (modo HOSTED_LINK): o pagador sai da plataforma
+ * e paga na página do banco; a confirmação chega depois, por webhook.
  *
- * Modelo PCI-DSS: o PAN e o CVV existem só durante a chamada de tokenização e são
- * imediatamente descartados; o "cofre" guarda apenas metadados (bandeira, last4, validade).
- * Em produção o cofre é o da adquirente/token service provider — o gateway só guarda o token.
+ * TODO(BB e Caixa): nenhuma API oficial de link de cartão dos dois bancos foi identificada nesta
+ * entrega. Falta definir o produto (e a adquirente por trás dele) e implementar um adapter real com
+ * este mesmo contrato. Até lá ficam simulados, e precisam ser confirmados com o banco:
+ *   - se existe API para invalidar um link, e se a invalidação é imediata;
+ *   - a validade mínima e máxima do link;
+ *   - se um mesmo link pode ser pago mais de uma vez;
+ *   - o atraso típico e o máximo do webhook de confirmação, e o formato dele.
  *
- * Cartões de teste (final do PAN):
- *   ...0002 → recusado (CARD_DECLINED) | ...0028 → timeout da adquirente | demais Luhn-válidos → aprovado
+ * O estado fica em memória (uma instância só) e o provedor é bloqueado em PRODUCTION.
  */
 @Injectable()
-export class MockAcquirerAdapter implements IPaymentGateway, ICardTokenizer {
+export class MockAcquirerAdapter implements IPaymentGateway {
   readonly provider = PROVIDER;
   readonly supportedMethods: ReadonlySet<PaymentMethod> = new Set([PaymentMethod.CREDIT_CARD]);
+  readonly cardModes: ReadonlySet<CardMode> = new Set<CardMode>(['HOSTED_LINK']);
   private readonly logger = new Logger(MockAcquirerAdapter.name);
-  private readonly vault = new Map<string, VaultEntry>();
-  private readonly charges = new Map<string, MockCharge>();
-  private readonly fingerprintKey = randomBytes(32);
+  private readonly links = new Map<string, MockLink>();
 
   validateConvenio(input: ConvenioValidationInput): ValidatedConvenioConfig {
     const settings = parseConvenioPart(settingsSchema, input.settings, 'settings');
     const credentials = parseConvenioPart(credentialsSchema, input.credentials, 'credentials');
-    assertNoProblems(input.environment === ProviderEnvironment.PRODUCTION ? ['a adquirente mock não pode ser usada em PRODUCTION'] : []);
+    assertNoProblems(input.environment === ProviderEnvironment.PRODUCTION ? ['o provedor simulado de link de cartão não pode ser usado em PRODUCTION'] : []);
     return { settings, credentials, urls: [] };
   }
 
-  async tokenizeCard(ctx: GatewayContext, card: RawCardData): Promise<CardTokenResult> {
-    await this.latency(ctx);
-    const operation = 'card.tokenize';
-    if (!isLuhnValid(card.number)) {
-      throw new BankRejectedError({ provider: PROVIDER, operation, bankErrorCode: 'INVALID_CARD_NUMBER', bankMessage: 'Número de cartão inválido' });
-    }
-    const now = new Date();
-    const expired = card.expYear < now.getUTCFullYear() || (card.expYear === now.getUTCFullYear() && card.expMonth < now.getUTCMonth() + 1);
-    if (expired) throw new BankRejectedError({ provider: PROVIDER, operation, bankErrorCode: 'EXPIRED_CARD', bankMessage: 'Cartão expirado' });
-
-    const token = `tok_mock_${randomBytes(18).toString('base64url')}`;
-    const entry: VaultEntry = {
-      brand: detectBrand(card.number),
-      last4: card.number.slice(-4),
-      expMonth: card.expMonth,
-      expYear: card.expYear,
-      fingerprint: createHmac('sha256', this.fingerprintKey).update(card.number).digest('hex').slice(0, 32),
-      convenioId: ctx.convenioId,
-    };
-    this.vault.set(token, entry);
-    return { token, brand: entry.brand, last4: entry.last4, expMonth: entry.expMonth, expYear: entry.expYear, fingerprint: entry.fingerprint };
-  }
-
-  providerReferenceFor(): string | undefined {
-    return undefined; // TID é atribuído pela adquirente
+  /** Papel do id do pedido nas adquirentes reais: conhecido antes do envio, permite consultar depois de um timeout. */
+  providerReferenceFor(_ctx: GatewayContext, request: ChargeRequest): string | undefined {
+    return request.method === PaymentMethod.CREDIT_CARD ? `lnk_${request.transactionId.replace(/-/g, '')}` : undefined;
   }
 
   async createCharge(ctx: GatewayContext, request: ChargeRequest): Promise<ChargeResult> {
-    if (request.method !== PaymentMethod.CREDIT_CARD) throw new UnsupportedPaymentMethodError(PROVIDER, request.method);
-    return this.authorize(ctx, request);
-  }
-
-  async getChargeStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
-    await this.latency(ctx);
-    const charge = this.charges.get(ref.providerReference);
-    if (!charge) return { status: TransactionStatus.PROCESSING, providerStatus: 'NOT_FOUND' };
-    return { status: charge.status, providerStatus: charge.status, paidAmountCents: charge.paidAt ? charge.amountCents : undefined, paidAt: charge.paidAt };
-  }
-
-  parseWebhook(): NormalizedWebhookEvent[] {
-    return [];
-  }
-
-  private async authorize(ctx: GatewayContext, req: CardChargeRequest): Promise<ChargeResult> {
-    await this.latency(ctx);
-    const operation = 'card.authorize';
-    const card = this.vault.get(req.cardToken);
-    if (!card || card.convenioId !== ctx.convenioId) {
-      throw new BankRejectedError({ provider: PROVIDER, operation, bankErrorCode: 'INVALID_TOKEN', bankMessage: 'Token de cartão inválido ou expirado' });
+    if (request.method !== PaymentMethod.CREDIT_CARD || request.mode !== 'HOSTED_LINK') {
+      throw new UnsupportedPaymentMethodError(PROVIDER, request.method === PaymentMethod.CREDIT_CARD ? `CREDIT_CARD/${request.mode}` : request.method);
     }
-    if (card.last4 === '0028') throw new BankTimeoutError({ provider: PROVIDER, operation });
+    const settings = await this.settings(ctx);
+    if (settings.createBehavior === 'TIMEOUT') throw new BankTimeoutError({ provider: PROVIDER, operation: 'card.link.create' });
 
-    const tid = `mock_${randomBytes(10).toString('hex')}`;
-    const cardData = { brand: card.brand, last4: card.last4, installments: req.installments, tid };
-    if (card.last4 === '0002') {
-      this.charges.set(tid, { status: TransactionStatus.FAILED, amountCents: req.amountCents });
-      return {
-        status: TransactionStatus.FAILED,
-        providerReference: tid,
-        providerData: { card: cardData },
-        failure: { code: 'CARD_DECLINED', message: 'Transação não autorizada pelo emissor' },
-      };
-    }
-
-    const status = req.capture ? TransactionStatus.PAID : TransactionStatus.AUTHORIZED;
-    const paidAt = req.capture ? new Date() : undefined;
-    this.charges.set(tid, { status, amountCents: req.amountCents, paidAt });
-    this.logger.log({ msg: 'mock acquirer authorized', transactionId: req.transactionId, status });
+    const reference = this.providerReferenceFor(ctx, request)!;
+    const expiresAt = new Date(Date.now() + request.linkTtlSeconds * 1000);
+    this.links.set(reference, { convenioId: ctx.convenioId, amountCents: request.amountCents, expiresAt, canceled: false, payments: [] });
+    this.logger.log({ msg: 'mock card link created', transactionId: request.transactionId, expiresAt });
     return {
-      status,
-      providerReference: tid,
-      providerData: {
-        card: { ...cardData, authorizationCode: randomInt(100000, 999999).toString(), nsu: randomInt(1e8, 1e9 - 1).toString() },
-      },
-      ...(paidAt ? { paidAt, paidAmountCents: req.amountCents } : {}),
+      status: TransactionStatus.PENDENTE,
+      providerReference: reference,
+      providerData: { card: { mode: 'HOSTED_LINK', paymentUrl: `${settings.linkBaseUrl}/${reference}`, maxInstallments: request.maxInstallments } },
+      expiresAt,
     };
   }
 
-  private async latency(ctx: GatewayContext): Promise<void> {
-    const ms = settingsSchema.parse(ctx.settings).simulatedLatencyMs;
-    if (ms > 0) await sleep(ms);
+  async getStatus(ctx: GatewayContext, ref: ChargeReference): Promise<ChargeStatusResult> {
+    await this.settings(ctx);
+    const link = this.find(ctx, ref.providerReference);
+    if (!link) {
+      // Mesmo contrato de um 404 real: passada a carência, conclui-se que o link nunca foi criado.
+      throw new BankRejectedError({ provider: PROVIDER, operation: 'card.link.get', bankHttpStatus: 404, bankErrorCode: 'LINK_NOT_FOUND', bankMessage: 'Link não encontrado' });
+    }
+    if (link.payments.length > 0) return { status: TransactionStatus.CONFIRMADA, providerStatus: 'PAID', payments: link.payments };
+    if (link.canceled) return { status: TransactionStatus.CANCELADA, providerStatus: 'CANCELED' };
+    if (link.expiresAt.getTime() <= Date.now()) return { status: TransactionStatus.EXPIRADA, providerStatus: 'EXPIRED' };
+    return { status: TransactionStatus.PENDENTE, providerStatus: 'OPEN' };
   }
-}
 
-export function detectBrand(pan: string): string {
-  if (/^(4011(78|79)|43(1274|8935)|45(1416|7393|763(1|2))|50(4175|6699|67[0-7][0-9]|9000)|627780|63(6297|6368)|650(0|4|5)|65(16|50))/.test(pan)) return 'ELO';
-  if (/^(606282|3841)/.test(pan)) return 'HIPERCARD';
-  if (/^3[47]/.test(pan)) return 'AMEX';
-  if (/^4/.test(pan)) return 'VISA';
-  if (/^(5[1-5]|2(2[2-9]|[3-6]\d|7[01]|720))/.test(pan)) return 'MASTERCARD';
-  return 'UNKNOWN';
+  async cancel(ctx: GatewayContext, ref: ChargeReference): Promise<CancelResult> {
+    const settings = await this.settings(ctx);
+    const operation = 'card.link.cancel';
+    if (settings.cancelBehavior === 'UNSUPPORTED') return { outcome: 'NOT_SUPPORTED', reason: 'o provedor não oferece cancelamento de link de pagamento' };
+    if (settings.cancelBehavior === 'ERROR') return { outcome: 'TECHNICAL_ERROR', error: new BankUnavailableError({ provider: PROVIDER, operation }, 'UNCERTAIN') };
+
+    const link = this.find(ctx, ref.providerReference);
+    if (!link) return { outcome: 'TECHNICAL_ERROR', error: new BankRejectedError({ provider: PROVIDER, operation, bankHttpStatus: 404, bankErrorCode: 'LINK_NOT_FOUND' }) };
+    if (link.payments.length > 0) return { outcome: 'ALREADY_PAID', providerStatus: 'PAID', payments: link.payments };
+    if (settings.cancelBehavior === 'REFUSE') return { outcome: 'REFUSED', providerStatus: 'OPEN', reason: 'cancelamento recusado pelo provedor' };
+    link.canceled = true;
+    return { outcome: 'CANCELED', providerStatus: 'CANCELED' };
+  }
+
+  parseWebhook(payload: unknown): NormalizedWebhookEvent[] {
+    const parsed = webhookSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    const event = parsed.data;
+    return [
+      {
+        eventKey: `card:${event.paymentId}`,
+        type: 'CARD_PAID',
+        providerReference: event.reference,
+        paymentId: event.paymentId,
+        amountCents: event.amountCents,
+        occurredAt: new Date(event.paidAt),
+        raw: event,
+      },
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ganchos de simulação: fazem o papel do pagador na página do banco.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Registra um pagamento no link e devolve o webhook que o banco enviaria.
+   * Por padrão só aceita link aberto. `force` simula o que ainda não se sabe se o banco impede:
+   * pagamento com o link vencido ou cancelado (confirmação tardia) e segundo pagamento do mesmo link.
+   */
+  simulatePayment(reference: string, options: { force?: boolean } = {}): MockAcquirerWebhook {
+    const link = this.links.get(reference);
+    if (!link) throw new Error(`link desconhecido: ${reference}`);
+    const open = !link.canceled && link.payments.length === 0 && link.expiresAt.getTime() > Date.now();
+    if (!open && !options.force) throw new Error('o link não aceita pagamento (vencido, cancelado ou já pago)');
+    const payment = { id: `pay_${randomBytes(10).toString('hex')}`, amountCents: link.amountCents, paidAt: new Date() };
+    link.payments.push(payment);
+    return { type: 'payment.confirmed', reference, paymentId: payment.id, amountCents: payment.amountCents, paidAt: payment.paidAt.toISOString() };
+  }
+
+  /** Antecipa o vencimento do link no provedor (os testes não esperam o relógio). */
+  simulateExpiration(reference: string): void {
+    const link = this.links.get(reference);
+    if (!link) throw new Error(`link desconhecido: ${reference}`);
+    link.expiresAt = new Date(Date.now() - 1000);
+  }
+
+  private find(ctx: GatewayContext, reference: string): MockLink | undefined {
+    const link = this.links.get(reference);
+    return link && link.convenioId === ctx.convenioId ? link : undefined;
+  }
+
+  private async settings(ctx: GatewayContext): Promise<z.infer<typeof settingsSchema>> {
+    const settings = settingsSchema.parse(ctx.settings);
+    if (settings.simulatedLatencyMs > 0) await sleep(settings.simulatedLatencyMs);
+    return settings;
+  }
 }

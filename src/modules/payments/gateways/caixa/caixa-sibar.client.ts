@@ -33,7 +33,7 @@ export interface SibarHeaderInput {
   versao: string;
   autenticacao: string;
   usuarioServico: string;
-  operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO';
+  operacao: 'INCLUI_BOLETO' | 'CONSULTA_BOLETO' | 'BAIXA_BOLETO';
   sistemaOrigem: string;
   unidade: string;
   now?: Date;
@@ -131,6 +131,20 @@ export function buildConsultaBoletoXml(h: SibarHeaderInput, codigoBeneficiario: 
   );
 }
 
+/**
+ * BAIXA_BOLETO: pede a baixa (cancelamento) do título, no serviço de manutenção.
+ *
+ * TODO(homologação Caixa): a operação existe no webservice SIGCB, mas a estrutura abaixo
+ * (CODIGO_BENEFICIARIO + NOSSO_NUMERO, hash com vencimento e valor zerados, como na consulta)
+ * NÃO foi conferida no manual oficial nesta entrega. Validar com o kit de homologação antes de produção.
+ */
+export function buildBaixaBoletoXml(h: SibarHeaderInput, codigoBeneficiario: string, nossoNumero: string): string {
+  return envelope(
+    NS_MANUTENCAO,
+    header(h) + `<DADOS><BAIXA_BOLETO>${x('CODIGO_BENEFICIARIO', codigoBeneficiario)}${x('NOSSO_NUMERO', nossoNumero)}</BAIXA_BOLETO></DADOS>`,
+  );
+}
+
 // fast-xml-parser não resolve entidades externas/DTD (sem XXE). parseTagValue=false preserva zeros à esquerda.
 const parser = new XMLParser({ removeNSPrefix: true, ignoreAttributes: true, parseTagValue: false, trimValues: true, processEntities: true, htmlEntities: false });
 
@@ -148,6 +162,13 @@ function collect(node: unknown, key: string, out: unknown[] = []): unknown[] {
 }
 
 const asText = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+
+/** Primeiro valor textual de uma tag, em qualquer nível da resposta. */
+export function findSibarText(node: unknown, key: string): string | undefined {
+  return collect(node, key)
+    .map(asText)
+    .find((v): v is string => !!v);
+}
 
 export interface SibarResult {
   dados: XmlNode;

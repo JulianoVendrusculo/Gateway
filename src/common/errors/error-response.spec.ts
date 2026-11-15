@@ -1,5 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { BankRejectedError, BankTimeoutError, IdempotencyKeyReusedError } from './index';
+import { BankRejectedError, BankTimeoutError, CryptoIntegrityError, IdempotencyKeyReusedError } from './index';
 import { mapError } from './error-response';
 
 describe('mapError', () => {
@@ -23,6 +23,12 @@ describe('mapError', () => {
     expect(mapError(new BadRequestException('Unexpected end of JSON input')).body.error).toMatchObject({ code: 'INVALID_JSON', message: 'JSON malformado' });
     expect(mapError(new NotFoundException()).body.error.code).toBe('NOT_FOUND');
     expect(mapError(new IdempotencyKeyReusedError()).status).toBe(422);
+  });
+
+  it('falha de decifragem não revela o motivo ao cliente, só ao log', () => {
+    const err = new CryptoIntegrityError('chave de criptografia desconhecida: k9');
+    expect(mapError(err, 'req-1').body).toEqual({ error: { code: 'INTERNAL_ERROR', message: 'Erro interno', requestId: 'req-1' } });
+    expect(err.reason).toBe('chave de criptografia desconhecida: k9');
   });
 
   it('erro desconhecido vira 500 genérico', () => {

@@ -42,6 +42,7 @@ export class WebhookAuthGuard implements CanActivate {
         PaymentProvider.CAIXA,
         { secret: config.get('WEBHOOK_SECRET_CAIXA'), allowedSubjects: config.get('WEBHOOK_CAIXA_ALLOWED_SUBJECTS'), allowedIps: buildBlockList(config.get('WEBHOOK_CAIXA_ALLOWED_IPS')) },
       ],
+      [PaymentProvider.MOCK_ACQUIRER, { secret: config.get('WEBHOOK_SECRET_MOCK_ACQUIRER'), allowedSubjects: [], allowedIps: undefined }],
     ]);
   }
 
@@ -54,6 +55,8 @@ export class WebhookAuthGuard implements CanActivate {
       throw new UnauthorizedError();
     };
     if (!policy) return reject('unknown_provider');
+    // O provedor simulado nunca recebe notificações em produção.
+    if (provider === PaymentProvider.MOCK_ACQUIRER && this.config.isProduction) return reject('mock_provider_in_production');
 
     if (this.config.get('WEBHOOK_REQUIRE_MTLS')) {
       const verify = req.headers[this.config.get('WEBHOOK_MTLS_VERIFY_HEADER').toLowerCase()];

@@ -85,6 +85,55 @@ export class ConcurrentModificationError extends ConflictError {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v2 — cobrança única. Os três primeiros códigos são contrato com o front.
+// ---------------------------------------------------------------------------
+
+/** A cobrança já foi paga: nenhuma nova tentativa é criada. */
+export class PaymentAlreadyConfirmedError extends ConflictError {
+  override readonly code = 'PAGAMENTO_JA_CONFIRMADO';
+  constructor(details: { chargeId: string; paidTransactionId: string | null }) {
+    super('Esta cobrança já foi paga', { details });
+  }
+}
+
+/**
+ * Existe uma tentativa que ainda não pode ser substituída: em criação, em verificação
+ * depois do vencimento, ou com troca de método em andamento. O front deve aguardar e consultar a cobrança.
+ */
+export class AttemptInProgressError extends ConflictError {
+  override readonly code = 'TENTATIVA_EM_ANDAMENTO';
+  override readonly retryable = true;
+  constructor(details: { reason: string; transactionId?: string; status?: string; method?: string; until?: string | null }) {
+    super('Há uma tentativa de pagamento em andamento para esta cobrança', { details });
+  }
+}
+
+/** A tentativa ativa não pôde ser cancelada no banco, então a troca de método fica bloqueada. */
+export class CancellationRefusedError extends ConflictError {
+  override readonly code = 'CANCELAMENTO_RECUSADO';
+  constructor(details: { reason: string; transactionId: string; method: string; activeUntil: string | null; limitation?: boolean }) {
+    super('A tentativa de pagamento atual não pôde ser cancelada; a troca de método está bloqueada', { details });
+  }
+}
+
+/** O valor informado difere do valor da cobrança já aberta para a mesma inscrição. */
+export class ChargeAmountMismatchError extends AppError {
+  readonly code = 'COBRANCA_VALOR_DIVERGENTE';
+  readonly httpStatus = 422;
+  constructor(details: { chargeId: string; chargeAmount: number; requestedAmount: number }) {
+    super('O valor informado é diferente do valor da cobrança desta inscrição', { details });
+  }
+}
+
+/** A cobrança foi cancelada ou expirou: não aceita novas tentativas. */
+export class ChargeClosedError extends ConflictError {
+  override readonly code = 'COBRANCA_ENCERRADA';
+  constructor(details: { chargeId: string; status: string }) {
+    super('Esta cobrança está encerrada e não aceita novas tentativas de pagamento', { details });
+  }
+}
+
 export class IdempotencyKeyRequiredError extends AppError {
   readonly code = 'IDEMPOTENCY_KEY_REQUIRED';
   readonly httpStatus = 400;
@@ -118,12 +167,18 @@ export class IdempotencyInProgressError extends AppError {
   }
 }
 
-/** Falha de integridade/decifragem — nunca expõe detalhes ao cliente. */
+/**
+ * Falha de integridade/decifragem. O motivo fica em `reason`, que vai para o log junto do erro;
+ * `details` (que o cliente recebe) fica vazio para não revelar o estado do chaveiro.
+ */
 export class CryptoIntegrityError extends AppError {
   readonly code = 'INTERNAL_ERROR';
   readonly httpStatus = 500;
-  constructor(reason: string, options: AppErrorOptions = {}) {
-    super('Erro interno', { ...options, details: { reason } });
+  constructor(
+    readonly reason: string,
+    options: AppErrorOptions = {},
+  ) {
+    super('Erro interno', { cause: options.cause });
   }
 }
 

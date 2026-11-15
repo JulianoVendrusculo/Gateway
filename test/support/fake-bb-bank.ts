@@ -47,6 +47,13 @@ export class FakeBbBank {
   readonly boletos = new Map<string, Boleto>();
   readonly clientSubjects: string[] = [];
   readonly requests: Array<{ method: string; path: string; body: unknown }> = [];
+  /** Atraso (ms) entre registrar a cobrança Pix e responder: simula a resposta ainda em trânsito. */
+  cobResponseDelayMs = 0;
+  /**
+   * Resposta ao pedido de cancelamento (remoção da cobrança Pix ou baixa do boleto):
+   * OK cancela; REFUSE recusa e a cobrança continua podendo ser paga; ERROR devolve 503.
+   */
+  cancelBehavior: 'OK' | 'REFUSE' | 'ERROR' = 'OK';
 
   get baseUrl(): string {
     return `https://localhost:${(this.server!.address() as AddressInfo).port}`;
@@ -72,14 +79,21 @@ export class FakeBbBank {
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
   }
 
+  /** Marca a cobrança como paga, mesmo que já removida (pagamento que cruzou com o cancelamento). */
   payPix(txid: string): void {
     const cob = this.cobs.get(txid)!;
     cob.status = 'CONCLUIDA';
     cob.paidAt = new Date().toISOString();
   }
 
+  /** Liquida o título, mesmo que já baixado (boleto pago em outro banco e compensado depois da baixa). */
   liquidateBoleto(numero: string): void {
     this.boletos.get(numero)!.estado = 6;
+  }
+
+  /** Quantos instrumentos o pagador ainda conseguiria pagar: cobranças Pix ativas e boletos em aberto. */
+  payableCount(): number {
+    return [...this.cobs.values()].filter((c) => c.status === 'ATIVA').length + [...this.boletos.values()].filter((b) => b.estado === 1).length;
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -114,7 +128,19 @@ export class FakeBbBank {
       }
       const cob: Cob = { txid: cobMatch[1], status: 'ATIVA', criacao: new Date().toISOString(), expiracao: b.calendario.expiracao, valor: b.valor.original, location: `pix.example.com/qr/v2/${randomUUID()}` };
       this.cobs.set(cob.txid, cob);
+      if (this.cobResponseDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.cobResponseDelayMs));
       return send(201, this.cobJson(cob));
+    }
+    if (cobMatch && req.method === 'PATCH') {
+      const cob = this.cobs.get(cobMatch[1]);
+      if (!cob) return send(404, { title: 'Cobrança não encontrada', status: 404 });
+      if (this.cancelBehavior === 'ERROR') return send(503, { title: 'Serviço indisponível', status: 503 });
+      // Especificação do Bacen: alterar cobrança que não está ATIVA resulta em 400 CobOperacaoInvalida.
+      if (cob.status !== 'ATIVA' || this.cancelBehavior === 'REFUSE') {
+        return send(400, { type: 'https://pix.bcb.gov.br/api/v2/error/CobOperacaoInvalida', title: 'Cobrança inválida.', status: 400, detail: 'A cobrança não está ATIVA, e a presente requisição busca alterá-la.' });
+      }
+      cob.status = (body as { status: string }).status;
+      return send(200, this.cobJson(cob));
     }
     if (cobMatch && req.method === 'GET') {
       const cob = this.cobs.get(cobMatch[1]);
@@ -135,6 +161,15 @@ export class FakeBbBank {
       // 7.77 simula "registrou, mas a resposta se perdeu" (resultado incerto).
       if (b.valorOriginal === 7.77) return send(503, { erros: [{ codigo: '503', mensagem: 'Serviço indisponível' }] });
       return send(201, { numero: boleto.numero, linhaDigitavel: boleto.linha, codigoBarraNumerico: boleto.barcode });
+    }
+    const baixaMatch = /^\/cobrancas\/v2\/boletos\/(\d{20})\/baixar$/.exec(url.pathname);
+    if (baixaMatch && req.method === 'POST') {
+      const boleto = this.boletos.get(baixaMatch[1]);
+      if (!boleto) return send(404, { erros: [{ codigo: '404', mensagem: 'Título não encontrado' }] });
+      if (this.cancelBehavior === 'ERROR') return send(503, { erros: [{ codigo: '503', mensagem: 'Serviço indisponível' }] });
+      if (boleto.estado !== 1 || this.cancelBehavior === 'REFUSE') return send(400, { erros: [{ codigo: '400', mensagem: 'Título não pode ser baixado' }] });
+      boleto.estado = 7;
+      return send(200, { numeroContratoCobranca: '19581316', dataBaixa: '15.11.2026', horarioBaixa: '10:00:00' });
     }
     const boletoMatch = /^\/cobrancas\/v2\/boletos\/(\d{20})$/.exec(url.pathname);
     if (boletoMatch && req.method === 'GET') {
